@@ -1,0 +1,71 @@
+name: Build Android App
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch: # 允许手动触发构建
+
+jobs:
+  build:
+    name: Build Go Core & Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 检出代码
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # 2. 设置 Java 环境 (用于 Android Gradle)
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # 3. 设置 Go 环境 (用于编译核心库)
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true # 开启 Go 缓存加速构建
+
+      # 4. 安装 Gomobile 工具链
+      - name: Install Gomobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          gomobile init
+
+      # 5. 编译 Go 核心为 AAR
+      - name: Build Core AAR
+        working-directory: ./mandala-go
+        run: |
+          echo "Building Mandala Core..."
+          # 编译 Go 代码生成 .aar 和 .jar
+          # 注意：输出路径直接指向 Android 项目的 libs 目录
+          gomobile bind -target=android -o ../android/app/libs/mandala.aar ./mobile
+          
+      # 6. 验证 AAR 是否生成
+      - name: Verify AAR Existence
+        run: |
+          ls -lh android/app/libs/
+          
+      # 7. 设置 Gradle 执行权限
+      - name: Grant Execute Permission for Gradlew
+        working-directory: ./android
+        run: chmod +x gradlew
+
+      # 8. 构建 Android APK (Debug 版)
+      # 如果需要 Release 版，请配置签名并改用 assembleRelease
+      - name: Build with Gradle
+        working-directory: ./android
+        run: ./gradlew assembleDebug --stacktrace
+
+      # 9. 上传 APK 产物
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mandala-Android-Debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 7
