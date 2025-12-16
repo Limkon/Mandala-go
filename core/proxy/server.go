@@ -74,3 +74,12 @@ func (s *Server) serve() {
 		go handler.HandleConnection(conn)
 	}
 }
+// core/proxy/server.go 追加内容:
+func IsRunning() bool {
+	if GlobalServer == nil {
+		return false
+	}
+	GlobalServer.mu.Lock()
+	defer GlobalServer.mu.Unlock()
+	return GlobalServer.running
+}
