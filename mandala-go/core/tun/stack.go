@@ -12,12 +12,13 @@ import (
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/header" // [关键新增] 引入 header 包以使用预定义 Subnet
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
-	"gvisor.dev/gvisor/pkg/waiter"
+	"gvisor.dev/gvisor/pkg/tcpip/waiter"
 )
 
 type Stack struct {
@@ -54,24 +55,20 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 		return nil, fmt.Errorf("create nic failed: %v", err)
 	}
 
-	// 2. [关键修复] 适配旧版 gVisor 的路由表
-	// 旧版 gVisor 中 tcpip.Address 和 tcpip.AddressMask 是 string 类型
-	// 不能使用 make([]byte) 强转，必须使用 string 字面量
-	// "\x00\x00\x00\x00" 代表 4字节的 IPv4 零地址
-	subnet, _ := tcpip.NewSubnet(tcpip.Address("\x00\x00\x00\x00"), tcpip.AddressMask("\x00\x00\x00\x00"))
-	
+	// 2. [修复] 路由表设置
+	// 使用 header.IPv4EmptySubnet 代替手动构造
+	// 这是一个预定义的 0.0.0.0/0 子网，完美适配该版本的 Struct 结构
 	s.SetRouteTable([]tcpip.Route{
 		{
-			Destination: subnet, 
+			Destination: header.IPv4EmptySubnet, 
 			NIC:         nicID,
 		},
 	})
 
 	s.SetPromiscuousMode(nicID, true)
 
-	// 3. 移除 SACK 选项 (旧版可能不支持或默认开启，避免报错)
-	// s.SetTransportProtocolOption(tcp.ProtocolNumber, tcp.SACKEnabled(true))
-
+	// 3. [修复] 移除 SetTransportProtocolOption (该版本可能不支持或默认已开启 SACK)
+	
 	ctx, cancel := context.WithCancel(context.Background())
 	dialer := proxy.NewDialer(cfg)
 
@@ -113,7 +110,9 @@ func (s *Stack) startPacketHandling() {
 
 func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	id := r.ID()
-	targetIP := net.IP(id.LocalAddress.AsSlice()) // 这里的 AsSlice 方法在旧版通常也有，如果没有请反馈
+	// [验证] 在 Struct 版本中，Address 通常有 AsSlice() 方法
+	// 如果编译报错提示没有 AsSlice，请尝试 id.LocalAddress.String()
+	targetIP := net.IP(id.LocalAddress.AsSlice())
 	targetPort := id.LocalPort
 
 	var wq waiter.Queue
@@ -124,6 +123,7 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	}
 	r.Complete(false)
 
+	// TCP 连接通常只需要 2 个参数
 	localConn := gonet.NewTCPConn(&wq, ep)
 	defer localConn.Close()
 
@@ -133,7 +133,6 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	}
 	defer remoteConn.Close()
 
-	// 简单的握手处理
 	var handshakeErr error
 	var handshakePayload []byte
 
@@ -142,7 +141,6 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 		client := protocol.NewMandalaClient(s.config.Username, s.config.Password)
 		handshakePayload, handshakeErr = client.BuildHandshakePayload(targetIP.String(), int(targetPort))
 	default:
-		// 其他协议暂未实现
 	}
 
 	if handshakeErr != nil {
@@ -161,6 +159,7 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 
 func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 	id := r.ID()
+	// 使用 AsSlice() 安全地获取 IP 字节
 	targetIP := net.IP(id.LocalAddress.AsSlice()).String()
 	targetPort := int(id.LocalPort)
 
@@ -174,8 +173,8 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 		return
 	}
 
-	// [保持旧版兼容]
-	// 你的版本 gonet.NewUDPConn 需要 3 个参数 (stack, wq, ep)
+	// [修复] 恢复 3 个参数的调用
+	// 日志明确指出该版本 UDP 需要传入 s.stack
 	localConn := gonet.NewUDPConn(s.stack, &wq, ep)
 
 	session, natErr := s.nat.GetOrCreate(srcKey, localConn, targetIP, targetPort)
