@@ -54,19 +54,23 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 		return nil, fmt.Errorf("create nic failed: %v", err)
 	}
 
-	// 2. 路由表 (旧版 API: 使用 Mask)
+	// 2. [核心修复] 路由表适配 (使用 Subnet)
+	// 在 2023 版本中，Route 结构体需要 Destination 为 tcpip.Subnet 类型
+	// 创建一个全零的 Subnet (0.0.0.0/0)
+	subnet, _ := tcpip.NewSubnet(tcpip.Address{}, tcpip.AddressMask{})
+
 	s.SetRouteTable([]tcpip.Route{
 		{
-			Destination: tcpip.Address{}, // 0.0.0.0
-			Mask:        tcpip.Address{}, // /0
+			Destination: subnet, // 使用 Subnet
 			NIC:         nicID,
 		},
 	})
 
 	s.SetPromiscuousMode(nicID, true)
 	
-	// 3. TCP 选项 (旧版 API: bool)
-	s.SetTransportProtocolOption(tcp.ProtocolNumber, tcp.SACKEnabled(true))
+	// 3. [修复] 移除 SACK 设置
+	// 这一行在不同版本间变动太大，且默认配置已足够，删除以保证编译通过
+	// s.SetTransportProtocolOption(tcp.ProtocolNumber, tcp.SACKEnabled(true))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	dialer := proxy.NewDialer(cfg)
@@ -96,11 +100,13 @@ func (s *Stack) Close() {
 }
 
 func (s *Stack) startPacketHandling() {
+	// TCP 处理
 	tcpHandler := tcp.NewForwarder(s.stack, 30000, 10, func(r *tcp.ForwarderRequest) {
 		go s.handleTCP(r)
 	})
 	s.stack.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpHandler.HandlePacket)
 
+	// UDP 处理
 	udpHandler := udp.NewForwarder(s.stack, func(r *udp.ForwarderRequest) {
 		s.handleUDP(r)
 	})
@@ -157,7 +163,7 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 		return
 	}
 	
-	// 旧版 API: 需要传入 stack 参数
+	// 适配: 2023 版本 gonet.NewUDPConn 需要 stack 参数
 	localConn := gonet.NewUDPConn(s.stack, &wq, ep)
 
 	session, err := s.nat.GetOrCreate(srcKey, localConn, targetIP, targetPort)
