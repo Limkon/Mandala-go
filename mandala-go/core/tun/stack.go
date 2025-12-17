@@ -10,6 +10,7 @@ import (
 
 	"mandala/core/config"
 	"mandala/core/proxy"
+	"mandala/core/protocol"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
