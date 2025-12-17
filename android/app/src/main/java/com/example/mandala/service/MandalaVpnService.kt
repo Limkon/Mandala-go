@@ -84,10 +84,12 @@ class MandalaVpnService : VpnService() {
             // --- 步骤 B: 启动 Go 核心 (tun2socks 模式) ---
             Log.d("MandalaVpn", "2. 正在启动 Go 核心...")
             
-            // 注意: Mobile.startVpn 是我们在 lib.go 中新加的函数
-            // 参数: fd (int), mtu (int), config (json string)
-            // Gomobile 可能会将 Go 的 int 映射为 Java 的 long，如果编译报错请尝试 fd.toLong()
-            val err = Mobile.startVpn(fd, VPN_MTU, configJson)
+            // [修复] Gomobile 将 Go 的 int 映射为 Java 的 long (64位系统上)
+            // 必须显式转换为 Long，否则编译报错
+            val fdLong = fd.toLong()
+            val mtuLong = VPN_MTU.toLong()
+            
+            val err = Mobile.startVpn(fdLong, mtuLong, configJson)
             
             if (err.isNotEmpty()) {
                 Log.e("MandalaVpn", "Go 核心启动失败: $err")
