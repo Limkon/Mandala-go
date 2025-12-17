@@ -1,4 +1,4 @@
-// 文件路徑: android/app/src/main/java/com/example/mandala/ui/settings/SettingsScreen.kt
+// 文件路径: android/app/src/main/java/com/example/mandala/ui/settings/SettingsScreen.kt
 
 package com.example.mandala.ui.settings
 
@@ -22,50 +22,50 @@ fun SettingsScreen(viewModel: MainViewModel) {
             .padding(16.dp)
             .verticalScroll(rememberScrollState())
     ) {
-        Text("Settings", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+        Text("设置", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
         Spacer(modifier = Modifier.height(24.dp))
 
-        // 連接設置
-        SettingSection("Connection") {
+        // 连接设置
+        SettingSection("连接设置") {
             SwitchSetting(
-                title = "VPN Mode",
-                subtitle = "Route all device traffic through Mandala",
+                title = "VPN 模式",
+                subtitle = "通过 Mandala 路由所有设备流量",
                 initialState = true
             )
             SwitchSetting(
-                title = "Allow Insecure",
-                subtitle = "Skip TLS certificate verification (Dangerous)",
+                title = "允许不安全连接",
+                subtitle = "跳过 TLS 证书验证 (危险)",
                 initialState = false
             )
         }
 
-        // Mandala 協議設置
-        SettingSection("Mandala Protocol (Core)") {
+        // Mandala 协议设置
+        SettingSection("协议参数 (核心)") {
             SwitchSetting(
-                title = "TLS Fragment",
-                subtitle = "Split TLS records to bypass DPI",
+                title = "TLS 分片",
+                subtitle = "拆分 TLS 记录以绕过 DPI 检测",
                 initialState = true
             )
             SwitchSetting(
-                title = "Random Padding",
-                subtitle = "Add random noise to packets",
+                title = "随机填充",
+                subtitle = "向数据包添加随机噪音",
                 initialState = false
             )
             TextSetting(
-                title = "Local Port",
+                title = "本地监听端口",
                 value = "10809"
             )
         }
 
-        // 關於
-        SettingSection("About") {
+        // 关于
+        SettingSection("关于") {
             Text(
-                "Mandala Client v1.0.0",
+                "Mandala 客户端 v1.0.0",
                 style = MaterialTheme.typography.bodyMedium,
                 color = Color.Gray
             )
             Text(
-                "Core: Go 1.21 (Gomobile)",
+                "核心版本: Go 1.21 (Gomobile)",
                 style = MaterialTheme.typography.bodyMedium,
                 color = Color.Gray
             )
@@ -84,7 +84,7 @@ fun SettingSection(title: String, content: @Composable ColumnScope.() -> Unit) {
     Spacer(modifier = Modifier.height(8.dp))
     Card(
         modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface) // 簡單背景
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             content()
