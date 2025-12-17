@@ -17,15 +17,12 @@ const (
 	udpTimeout = 60 * time.Second
 )
 
-// UDPSession 代表一个活跃的 UDP 流
 type UDPSession struct {
-	// [关键修改] 字段首字母大写，允许外部访问
 	LocalConn  *gonet.UDPConn
 	RemoteConn net.Conn
 	LastActive time.Time
 }
 
-// UDPNatManager 管理所有 UDP 会话
 type UDPNatManager struct {
 	sessions sync.Map
 	dialer   *proxy.Dialer
