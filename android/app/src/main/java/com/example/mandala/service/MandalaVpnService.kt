@@ -26,7 +26,7 @@ class MandalaVpnService : VpnService() {
         // VPN 参数
         private const val VPN_ADDRESS = "172.16.0.1" // 虚拟网卡 IP
         private const val VPN_ROUTE = "0.0.0.0"      // 路由所有流量
-        private const val VPN_MTU = 1500
+        private const val VPN_MTU = 1500             // MTU (Int)
         private const val CHANNEL_ID = "MandalaVpnChannel"
         private const val NOTIFICATION_ID = 1
     }
@@ -83,13 +83,10 @@ class MandalaVpnService : VpnService() {
             // --- 步骤 B: 启动 Go 核心 (tun2socks 模式) ---
             Log.d("MandalaVpn", "2. 正在启动 Go 核心...")
             
-            // [关键修复]
-            // Go 'fd int32' -> Java 'int' (直接使用 fd)
-            // Go 'mtu int'   -> Java 'long' (需要转换)
-            val mtuLong = VPN_MTU.toLong()
-            
-            // 注意：这里移除了 fd.toLong()，因为 lib.go 中 fd 类型已改为 int32
-            val err = Mobile.startVpn(fd, mtuLong, configJson)
+            // [修复] Go 端 StartVpn(fd int32, mtu int32, ...)
+            // Java 端对应: startVpn(int, int, String)
+            // 直接传入 fd (Int) 和 VPN_MTU (Int)
+            val err = Mobile.startVpn(fd, VPN_MTU, configJson)
             
             if (err.isNotEmpty()) {
                 Log.e("MandalaVpn", "Go 核心启动失败: $err")
