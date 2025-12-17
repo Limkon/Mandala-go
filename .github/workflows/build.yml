@@ -22,44 +22,49 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'  # 保持 1.22，更兼容 gomobile
+          go-version: '1.22'  # 保持 1.22，更兼容
           cache: true
 
-      # 4. 安装 Gomobile（关键修复：使用 @latest，避免固定失效的 commit）
-      - name: Install Gomobile
+      # 4. 安装 Gomobile 和 Gobind（关键：同时安装两者）
+      - name: Install Gomobile and Gobind
         run: |
           go install golang.org/x/mobile/cmd/gomobile@latest
-          go install golang.org/x/mobile/cmd/gobind@latest  # 可选保险，gomobile 通常会自动处理
+          go install golang.org/x/mobile/cmd/gobind@latest
           
-          # 将 go bin 目录加入 PATH
+          # 加入 PATH
           echo "$HOME/go/bin" >> $GITHUB_PATH
           
-          # 输出版本用于调试
+          # 调试输出
           gomobile version
+          which gobind || echo "gobind not found"
+          gobind -h || echo "gobind help failed"
 
-      # 5. （可选）运行 gomobile init
-      #    在 Actions 中常因缺少 NDK/cmake 失败，但 bind 通常仍能工作
+      # 5. （可选）gomobile init
       - name: Gomobile Init (可选，可忽略失败)
         run: |
-          gomobile init || echo "gomobile init failed (common in CI), proceeding anyway"
+          gomobile init || echo "gomobile init failed (常见于 CI)，继续尝试 bind"
 
-      # 6. 编译 Go 核心为 AAR
+      # 6. 编译 Go 核心为 AAR（添加依赖拉取）
       - name: Build Core AAR
         working-directory: ./mandala-go
         run: |
           echo "Building Mandala Core..."
           
-          # 清理并同步依赖
+          # 强制添加 mobile 依赖并同步（确保 bind 包可用）
+          go get golang.org/x/mobile@latest
           go mod tidy
           
+          # 调试：检查 bind 包是否可用
+          go list golang.org/x/mobile/bind || echo "bind package not found (but may still work)"
+          
           # 生成 AAR
-          gomobile bind -target=android -androidapi 21 -o ../android/app/libs/mandala.aar ./mobile
+          gomobile bind -v -target=android -androidapi 21 -o ../android/app/libs/mandala.aar ./mobile
 
       # 7. 验证 AAR 是否生成
       - name: Verify AAR Existence
         run: |
-          ls -lh android/app/libs/
-          file android/app/libs/mandala.aar || true
+          ls -lh android/app/libs/ || echo "No files in libs"
+          file android/app/libs/mandala.aar || echo "AAR not generated"
 
       # 8. 设置 Gradle 环境
       - name: Setup Gradle
@@ -71,7 +76,7 @@ jobs:
       - name: Build with Gradle
         working-directory: ./android
         run: |
-          ./gradlew assembleDebug --stacktrace --no-daemon
+          ./gradlew assembleDebug --stacktrace --no-daemon --info
 
       # 10. 上传 APK 产物
       - name: Upload APK
