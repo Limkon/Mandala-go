@@ -25,16 +25,13 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          # 使用 1.24 以获得最佳性能，同时兼容旧代码
           go-version: '1.24'
           cache: true
 
-      - name: Install Gomobile and Gobind (Pinned Version)
+      - name: Install Gomobile Toolchain
         run: |
-          # [核心修复] 强制安装与 go.mod 中依赖完全一致的 2023 年版本工具
-          # 避免 "新工具调旧库" 导致的路径错误
+          # 安装与 go.mod 版本一致的工具
           VERSION="v0.0.0-20231127183840-76ac6878050a"
-          
           go install golang.org/x/mobile/cmd/gomobile@$VERSION
           go install golang.org/x/mobile/cmd/gobind@$VERSION
           
@@ -52,12 +49,13 @@ jobs:
           echo "Building Mandala Core..."
           rm -rf vendor
           
-          # [双重保险] 显式获取 bind 包，确保它在 go.mod 依赖树中
-          # 使用与工具相同的版本
-          go get golang.org/x/mobile/bind@v0.0.0-20231127183840-76ac6878050a
+          # [关键验证] 运行 tidy。因为有了 tools.go，它会自动下载并保留 mobile/bind 包
           go mod tidy
           
-          # 开始编译
+          # 验证依赖是否存在 (用于调试)
+          ls -d $(go env GOPATH)/pkg/mod/golang.org/x/mobile* || echo "Mobile package not found in cache"
+          
+          # 编译
           gomobile bind -v -target=android -androidapi 21 \
             -o $(pwd)/../android/app/libs/mandala.aar ./mobile
 
