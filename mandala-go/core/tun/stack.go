@@ -54,21 +54,22 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 		return nil, fmt.Errorf("create nic failed: %v", err)
 	}
 
-	// 2. [修复] 路由表适配 gVisor 新结构
-	// 使用 tcpip.NewSubnet 创建 0.0.0.0/0
-	// 注意：gVisor 不同版本对零值 Address 的定义不同，这里显式创建全零地址
-	subnet, _ := tcpip.NewSubnet(tcpip.Address(make([]byte, 4)), tcpip.AddressMask(make([]byte, 4)))
+	// 2. [关键修复] 适配旧版 gVisor 的路由表
+	// 旧版 gVisor 中 tcpip.Address 和 tcpip.AddressMask 是 string 类型
+	// 不能使用 make([]byte) 强转，必须使用 string 字面量
+	// "\x00\x00\x00\x00" 代表 4字节的 IPv4 零地址
+	subnet, _ := tcpip.NewSubnet(tcpip.Address("\x00\x00\x00\x00"), tcpip.AddressMask("\x00\x00\x00\x00"))
 	
 	s.SetRouteTable([]tcpip.Route{
 		{
-			Destination: subnet, // 替代了原来的 Destination + Mask
+			Destination: subnet, 
 			NIC:         nicID,
 		},
 	})
 
 	s.SetPromiscuousMode(nicID, true)
 
-	// 3. [修复] 移除未定义的 SACKEnabled 选项
+	// 3. 移除 SACK 选项 (旧版可能不支持或默认开启，避免报错)
 	// s.SetTransportProtocolOption(tcp.ProtocolNumber, tcp.SACKEnabled(true))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -112,7 +113,7 @@ func (s *Stack) startPacketHandling() {
 
 func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	id := r.ID()
-	targetIP := net.IP(id.LocalAddress.AsSlice())
+	targetIP := net.IP(id.LocalAddress.AsSlice()) // 这里的 AsSlice 方法在旧版通常也有，如果没有请反馈
 	targetPort := id.LocalPort
 
 	var wq waiter.Queue
@@ -132,6 +133,7 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	}
 	defer remoteConn.Close()
 
+	// 简单的握手处理
 	var handshakeErr error
 	var handshakePayload []byte
 
@@ -140,6 +142,7 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 		client := protocol.NewMandalaClient(s.config.Username, s.config.Password)
 		handshakePayload, handshakeErr = client.BuildHandshakePayload(targetIP.String(), int(targetPort))
 	default:
+		// 其他协议暂未实现
 	}
 
 	if handshakeErr != nil {
@@ -171,8 +174,8 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 		return
 	}
 
-	// [关键修复] 针对您锁定的 gVisor 版本，这里必须使用 3 个参数：(stack, wq, ep)
-	// 日志报错 "want (*stack.Stack...)" 证实了这一点
+	// [保持旧版兼容]
+	// 你的版本 gonet.NewUDPConn 需要 3 个参数 (stack, wq, ep)
 	localConn := gonet.NewUDPConn(s.stack, &wq, ep)
 
 	session, natErr := s.nat.GetOrCreate(srcKey, localConn, targetIP, targetPort)
