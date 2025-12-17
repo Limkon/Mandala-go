@@ -1,97 +1,76 @@
 name: Build Android App
 on:
-  workflow_dispatch: # 仅允许手动触发构建
+  workflow_dispatch:
 
 jobs:
   build:
     name: Build Go Core & Android APK
     runs-on: ubuntu-latest
     steps:
-      # 1. 检出代码
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 2. 设置 Java 环境
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      # 3. 设置 Go 环境
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.24'
           cache: true
 
-      # 4. 安装 Gomobile 和 Gobind
       - name: Install Gomobile and Gobind
         run: |
           go install golang.org/x/mobile/cmd/gomobile@latest
           go install golang.org/x/mobile/cmd/gobind@latest
-          
           echo "$HOME/go/bin" >> $GITHUB_PATH
-          
-          gomobile version || echo "gomobile version unknown (normal in CI)"
-          which gobind
+          gomobile version || echo "gomobile version unknown (normal)"
 
-      # 5. 关键调试：检查问题文件
-      - name: Debug Mandala Go File
-        working-directory: ./mandala-go
+      # 关键修复：确保目标目录存在并清理旧文件
+      - name: Prepare AAR Output Directory
         run: |
-          echo "=== 检查 mandala.go 文件是否存在和大小 ==="
-          ls -lh core/protocol/mandala.go
-          
-          echo "=== 文件前 20 行内容 ==="
-          head -n 20 core/protocol/mandala.go || echo "文件为空或无法读取"
-          
-          echo "=== 文件总行数 ==="
-          wc -l core/protocol/mandala.go
-          
-          echo "=== 检查 mobile 包下的所有 .go 文件 ==="
-          find ./mobile -name "*.go" -ls
+          mkdir -p android/app/libs
+          rm -f android/app/libs/mandala.aar  # 删除可能残留的旧文件
+          ls -la android/app/libs/
 
-      # 6. 编译 Go 核心为 AAR
       - name: Build Core AAR
         working-directory: ./mandala-go
         run: |
           echo "Building Mandala Core..."
-          
           rm -rf vendor
-          
           go mod tidy
-          
           go get -d golang.org/x/mobile@latest
-          
-          go list golang.org/x/mobile/bind || echo "bind may still work"
-          
-          gomobile bind -v -target=android -androidapi 21 -o ../android/app/libs/mandala.aar ./mobile
 
-      # 7. 验证 AAR 是否生成
+          # 使用绝对路径避免相对路径问题（强烈推荐）
+          gomobile bind -v -target=android -androidapi 21 \
+            -o $(pwd)/../android/app/libs/mandala.aar ./mobile
+
       - name: Verify AAR Existence
         run: |
-          ls -lh android/app/libs/ || echo "No libs directory"
+          echo "=== Contents of libs directory ==="
+          ls -lh android/app/libs/
           if [ -f android/app/libs/mandala.aar ]; then
             echo "AAR generated successfully!"
             file android/app/libs/mandala.aar
+            du -h android/app/libs/mandala.aar
           else
             echo "AAR generation failed"
+            exit 1
           fi
 
-      # 8. 设置 Gradle 环境
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.5'
 
-      # 9. 构建 Android APK
       - name: Build with Gradle
         working-directory: ./android
         run: |
           ./gradlew assembleDebug --stacktrace --info --no-daemon
 
-      # 10. 上传 APK 产物
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
