@@ -54,19 +54,22 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 		return nil, fmt.Errorf("create nic failed: %v", err)
 	}
 
-	// 2. 路由表设置
+	// 2. [修复] 路由表适配 gVisor 新结构
+	// 使用 tcpip.NewSubnet 创建 0.0.0.0/0
+	// 注意：gVisor 不同版本对零值 Address 的定义不同，这里显式创建全零地址
+	subnet, _ := tcpip.NewSubnet(tcpip.Address(make([]byte, 4)), tcpip.AddressMask(make([]byte, 4)))
+	
 	s.SetRouteTable([]tcpip.Route{
 		{
-			Destination: tcpip.Address{}, // 0.0.0.0
-			Mask:        tcpip.Address{}, // /0
+			Destination: subnet, // 替代了原来的 Destination + Mask
 			NIC:         nicID,
 		},
 	})
 
 	s.SetPromiscuousMode(nicID, true)
 
-	// 3. SACK 设置
-	s.SetTransportProtocolOption(tcp.ProtocolNumber, tcp.SACKEnabled(true))
+	// 3. [修复] 移除未定义的 SACKEnabled 选项
+	// s.SetTransportProtocolOption(tcp.ProtocolNumber, tcp.SACKEnabled(true))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	dialer := proxy.NewDialer(cfg)
@@ -113,18 +116,15 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	targetPort := id.LocalPort
 
 	var wq waiter.Queue
-	ep, err := r.CreateEndpoint(&wq) // err is tcpip.Error
+	ep, err := r.CreateEndpoint(&wq)
 	if err != nil {
 		r.Complete(true)
 		return
 	}
 	r.Complete(false)
 
-	// [已验证] NewTCPConn 使用 2 个参数
 	localConn := gonet.NewTCPConn(&wq, ep)
 	defer localConn.Close()
-
-	// fmt.Printf("[TCP] Connect to %s:%d\n", targetIP, targetPort)
 
 	remoteConn, dialErr := s.dialer.Dial()
 	if dialErr != nil {
@@ -132,7 +132,6 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	}
 	defer remoteConn.Close()
 
-	// 简单的握手处理逻辑
 	var handshakeErr error
 	var handshakePayload []byte
 
@@ -140,13 +139,10 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	case "mandala":
 		client := protocol.NewMandalaClient(s.config.Username, s.config.Password)
 		handshakePayload, handshakeErr = client.BuildHandshakePayload(targetIP.String(), int(targetPort))
-	// 暂时保留 VLESS/Trojan 的 TODO，避免编译错误，但在实际运行时需注意
 	default:
-		// 直连或其他未实现协议
 	}
 
 	if handshakeErr != nil {
-		// fmt.Printf("[Stack] Handshake build failed: %v\n", handshakeErr)
 		return
 	}
 
@@ -175,9 +171,9 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 		return
 	}
 
-	// [修复] gVisor API 变更，NewUDPConn 现在通常只需要 2 个参数 (wq, ep)
-	// 如果编译报错提示需要 3 个参数，请恢复 s.stack，但根据 handleTCP 的写法，此处应为 2 个。
-	localConn := gonet.NewUDPConn(&wq, ep)
+	// [关键修复] 针对您锁定的 gVisor 版本，这里必须使用 3 个参数：(stack, wq, ep)
+	// 日志报错 "want (*stack.Stack...)" 证实了这一点
+	localConn := gonet.NewUDPConn(s.stack, &wq, ep)
 
 	session, natErr := s.nat.GetOrCreate(srcKey, localConn, targetIP, targetPort)
 	if natErr != nil {
