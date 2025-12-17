@@ -19,7 +19,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	
-	// [关键修复] 旧版 gVisor 的 waiter 包在 pkg/waiter，而不是 pkg/tcpip/waiter
+	// [修正] 對於鎖定的舊版 gVisor，正確的路徑是 pkg/waiter
 	"gvisor.dev/gvisor/pkg/waiter" 
 )
 
@@ -39,7 +39,7 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 		return nil, err
 	}
 
-	// 1. 初始化协议栈
+	// 1. 初始化協議棧
 	s := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
 			ipv4.NewProtocol,
@@ -57,8 +57,9 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 		return nil, fmt.Errorf("create nic failed: %v", err)
 	}
 
-	// 2. 路由表设置
-	// 使用 header.IPv4EmptySubnet (0.0.0.0/0) 完美兼容 Struct 类型的 Subnet
+	// 2. 路由表設置
+	// 使用 header.IPv4EmptySubnet (即 0.0.0.0/0)
+	// 這是一個預定義的常量，能完美兼容 Subnet 結構體變化
 	s.SetRouteTable([]tcpip.Route{
 		{
 			Destination: header.IPv4EmptySubnet, 
@@ -68,8 +69,9 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 
 	s.SetPromiscuousMode(nicID, true)
 
-	// 3. 移除 SACK 选项以防报错
-	
+	// 3. 移除 SACK 選項 (舊版可能不支持或默認開啓，避免報錯)
+	// s.SetTransportProtocolOption(tcp.ProtocolNumber, tcp.SACKEnabled(true))
+
 	ctx, cancel := context.WithCancel(context.Background())
 	dialer := proxy.NewDialer(cfg)
 
@@ -111,8 +113,7 @@ func (s *Stack) startPacketHandling() {
 
 func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	id := r.ID()
-	// 注意：如果旧版 struct 没有 AsSlice()，这里可能需要调整
-	// 但通常 Address struct 版本都会带有 AsSlice()
+	// Address 結構體通常帶有 AsSlice() 方法轉換為字節
 	targetIP := net.IP(id.LocalAddress.AsSlice())
 	targetPort := id.LocalPort
 
@@ -172,7 +173,7 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 		return
 	}
 
-	// [保持] 3个参数，适配旧版 gonet
+	// [保持] 3個參數，適配舊版 gVisor 的 gonet.NewUDPConn
 	localConn := gonet.NewUDPConn(s.stack, &wq, ep)
 
 	session, natErr := s.nat.GetOrCreate(srcKey, localConn, targetIP, targetPort)
