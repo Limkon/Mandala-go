@@ -5,6 +5,8 @@ import (
 	"os"
 	"sync/atomic"
 
+	// [修复] 必须显式引入 tcpip 包，否则报错 undefined: tcpip
+	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -20,19 +22,17 @@ type Device struct {
 
 // NewDevice 创建一个新的 TUN 设备包装器
 func NewDevice(fd int, mtu uint32) (*Device, error) {
-	// 验证 FD 是否有效
 	if fd < 0 {
 		return nil, fmt.Errorf("invalid fd: %d", fd)
 	}
 
 	// 创建 gVisor 的基于 FD 的链路端点
-	// PacketDispatchMode: 这里只需要基本的读写
 	ep, err := fdbased.New(&fdbased.Options{
 		FDs: []int{fd},
 		MTU: mtu,
 		// Android VPN 通常没有以太网头，是纯 IP 包
 		EthernetHeader: false, 
-		// 自定义关闭回调，防止 double close
+		// 自定义关闭回调
 		ClosedFunc: func(e tcpip.Error) {},
 	})
 	if err != nil {
@@ -47,17 +47,14 @@ func NewDevice(fd int, mtu uint32) (*Device, error) {
 	}, nil
 }
 
-// LinkEndpoint 返回 gVisor 需要的链路端点接口
 func (d *Device) LinkEndpoint() stack.LinkEndpoint {
 	return d.linkEP
 }
 
-// Close 关闭设备
 func (d *Device) Close() error {
 	if !atomic.CompareAndSwapUint32(&d.closed, 0, 1) {
 		return nil
 	}
 	close(d.closeCh)
-	// 关闭文件描述符
 	return os.NewFile(uintptr(d.fd), "tun").Close()
 }
