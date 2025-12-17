@@ -24,8 +24,8 @@ func Start(localPort int, jsonConfig string) string {
 
 // StartVpn 启动 VPN 模式 (新模式)
 // fd: Android 传递过来的 TUN 文件描述符。
-// [修复] 使用 int32 强制对应 Java 的 int 类型，避免 32/64 位架构下的类型歧义。
-func StartVpn(fd int32, mtu int, jsonConfig string) string {
+// [修复] mtu 改为 int32，确保在 Java 侧映射为 int，避免 32/64 位系统下的类型歧义。
+func StartVpn(fd int32, mtu int32, jsonConfig string) string {
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -42,8 +42,8 @@ func StartVpn(fd int32, mtu int, jsonConfig string) string {
 	}
 
 	// 启动网络栈
-	// 注意：tun.StartStack 接收 int，这里需要转换
-	stack, err := tun.StartStack(int(fd), mtu, cfg)
+	// 注意：tun.StartStack 接收 int，这里将 int32 转换为 int
+	stack, err := tun.StartStack(int(fd), int(mtu), cfg)
 	if err != nil {
 		return fmt.Sprintf("Stack Error: %v", err)
 	}
