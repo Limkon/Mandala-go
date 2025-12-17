@@ -1,4 +1,4 @@
-// 文件路徑: android/app/src/main/java/com/example/mandala/MainActivity.kt
+// 文件路径: android/app/src/main/java/com/example/mandala/MainActivity.kt
 
 package com.example.mandala
 
@@ -22,14 +22,13 @@ import androidx.navigation.compose.rememberNavController
 import com.example.mandala.ui.home.HomeScreen
 import com.example.mandala.ui.profiles.ProfilesScreen
 import com.example.mandala.ui.settings.SettingsScreen
-import com.example.mandala.ui.theme.MandalaTheme // 需確保已有 Theme 文件，或使用 MaterialTheme 代替
 import com.example.mandala.viewmodel.MainViewModel
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            // 使用默認 MaterialTheme，如果你有自定義 Theme 請替換
+            // 使用 MaterialTheme
             MaterialTheme {
                 MainApp()
             }
@@ -41,15 +40,15 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun MainApp() {
     val navController = rememberNavController()
-    // 獲取 ViewModel 實例
+    // 获取 ViewModel 实例
     val viewModel: MainViewModel = viewModel()
     
-    // 底部導航配置
-    val items = listOf("Home", "Profiles", "Settings")
-    val icons = listOf(
-        Icons.Filled.Home,
-        Icons.Filled.List,
-        Icons.Filled.Settings
+    // 底部导航配置 - 使用中文标签
+    // Triple: (Label, Route, Icon)
+    val navItems = listOf(
+        Triple("首页", "Home", Icons.Filled.Home),
+        Triple("节点", "Profiles", Icons.Filled.List),
+        Triple("设置", "Settings", Icons.Filled.Settings)
     )
 
     Scaffold(
@@ -58,14 +57,14 @@ fun MainApp() {
                 val navBackStackEntry by navController.currentBackStackEntryAsState()
                 val currentRoute = navBackStackEntry?.destination?.route
 
-                items.forEachIndexed { index, screen ->
+                navItems.forEach { (label, route, icon) ->
                     NavigationBarItem(
-                        icon = { Icon(icons[index], contentDescription = screen) },
-                        label = { Text(screen) },
-                        selected = currentRoute == screen,
+                        icon = { Icon(icon, contentDescription = label) },
+                        label = { Text(label) },
+                        selected = currentRoute == route,
                         onClick = {
-                            navController.navigate(screen) {
-                                // 避免堆疊過多頁面
+                            navController.navigate(route) {
+                                // 避免堆叠过多页面
                                 popUpTo(navController.graph.startDestinationId) {
                                     saveState = true
                                 }
@@ -78,10 +77,10 @@ fun MainApp() {
             }
         }
     ) { innerPadding ->
-        // 導航主機
+        // 导航主机
         NavHost(
             navController = navController,
-            startDestination = "Home",
+            startDestination = "Home", // 路由 Key 保持英文，方便内部逻辑引用
             modifier = Modifier.padding(innerPadding)
         ) {
             composable("Home") { HomeScreen(viewModel) }
