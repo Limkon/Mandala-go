@@ -36,7 +36,7 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 		return nil, err
 	}
 
-	// 1. 初始化协议栈
+	// 1. 初始化協議棧
 	s := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
 			ipv4.NewProtocol,
@@ -54,20 +54,19 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 		return nil, fmt.Errorf("create nic failed: %v", err)
 	}
 
-	// 2. [适配新版] 路由表使用 Subnet 而非 Mask
-	// 创建 0.0.0.0/0 子网
-	subnet, _ := tcpip.NewSubnet(tcpip.AddrFrom4([4]byte{0, 0, 0, 0}), tcpip.MaskFromBytes([]byte{0, 0, 0, 0}))
-
+	// 2. [適配舊庫] 路由表使用 Mask
 	s.SetRouteTable([]tcpip.Route{
 		{
-			Destination: subnet, // 新版 API: 目标是一个子网
+			Destination: tcpip.Address{}, // 0.0.0.0
+			Mask:        tcpip.Address{}, // /0
 			NIC:         nicID,
 		},
 	})
 
 	s.SetPromiscuousMode(nicID, true)
 	
-	// 3. [适配新版] 移除过时的 SACK 选项设置，默认即可
+	// 3. [適配舊庫] SACK 設置
+	s.SetTransportProtocolOption(tcp.ProtocolNumber, tcp.SACKEnabled(true))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	dialer := proxy.NewDialer(cfg)
@@ -114,8 +113,7 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	targetPort := id.LocalPort
 	
 	var wq waiter.Queue
-	// [注意] ep 和 err 由 gVisor 返回，err 类型是 tcpip.Error 接口
-	ep, err := r.CreateEndpoint(&wq)
+	ep, err := r.CreateEndpoint(&wq) // err is tcpip.Error
 	if err != nil {
 		r.Complete(true)
 		return
@@ -127,7 +125,7 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	
 	fmt.Printf("[TCP] Connect to %s:%d\n", targetIP, targetPort)
 
-	// [适配新版] 使用新变量名 dialErr，避免与上面的 err (tcpip.Error) 发生类型冲突
+	// [關鍵修復] 使用 dialErr 避免變量類型衝突
 	remoteConn, dialErr := s.dialer.Dial()
 	if dialErr != nil {
 		return
@@ -160,10 +158,10 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 		return
 	}
 	
-	// [适配新版] gonet.NewUDPConn 不再需要 stack 参数
-	localConn := gonet.NewUDPConn(&wq, ep)
+	// [關鍵修復] 舊庫需要 3 個參數：(stack, wq, ep)
+	localConn := gonet.NewUDPConn(s.stack, &wq, ep)
 
-	// [适配新版] 使用 natErr 避免与 tcpip.Error 冲突
+	// [關鍵修復] 使用 natErr 避免衝突
 	session, natErr := s.nat.GetOrCreate(srcKey, localConn, targetIP, targetPort)
 	if natErr != nil {
 		localConn.Close()
