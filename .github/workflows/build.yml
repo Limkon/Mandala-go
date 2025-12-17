@@ -34,7 +34,7 @@ jobs:
           go install golang.org/x/mobile/cmd/gomobile@latest
           gomobile init
 
-      # 5. 编译 Go 核心为 AAR (最终修复：添加 -tags=bind 标签)
+      # 5. 编译 Go 核心为 AAR (修复：移除冲突的 -tags=bind 标签)
       - name: Build Core AAR
         working-directory: ./mandala-go
         run: |
@@ -44,9 +44,9 @@ jobs:
           go mod tidy
           
           # 编译 Go 代码生成 .aar
-          # 【最终修复】增加 -tags=bind 标志，强制 Go 编译系统解析 gomobile 内部的 'bind' 包依赖。
+          # 【最终修复】移除 -tags=bind 标志。此标志与 go mod tidy 冲突，且通常由 gomobile 内部处理。
           # 保留 -androidapi 21 修复。
-          gomobile bind -target=android -androidapi 21 -tags=bind -o ../android/app/libs/mandala.aar ./mobile
+          gomobile bind -target=android -androidapi 21 -o ../android/app/libs/mandala.aar ./mobile
 
       # 6. 验证 AAR 是否生成 (用于调试)
       - name: Verify AAR Existence
