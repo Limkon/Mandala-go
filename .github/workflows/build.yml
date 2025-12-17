@@ -1,7 +1,6 @@
 name: Build Android App
 on:
   workflow_dispatch:
-
 jobs:
   build:
     name: Build Go Core & Android APK
@@ -9,39 +8,42 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
-
       - name: Install libraries for AAPT2 (Ubuntu 24.04 ultimate fix)
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
           sudo apt-get install -y libc6:i386 libstdc++6:i386 lib32z1 zlib1g:i386
-
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.24'
           cache: true
-
       - name: Install Gomobile and Gobind
         run: |
           go install golang.org/x/mobile/cmd/gomobile@latest
           go install golang.org/x/mobile/cmd/gobind@latest
           echo "$HOME/go/bin" >> $GITHUB_PATH
           gomobile version || echo "gomobile version unknown (normal)"
-
+      # 新增：自动更新 gVisor 到最新版本，避免旧 commit 失效
+      - name: Update gVisor to latest
+        working-directory: ./mandala-go
+        run: |
+          echo "Updating gVisor to latest version..."
+          go get -u gvisor.dev/gvisor@latest
+          go mod tidy
+          echo "gVisor updated. Current version in go.mod:"
+          grep gvisor.dev/gvisor go.mod || echo "gVisor not found in go.mod"
       # 关键修复：确保目标目录存在并清理旧文件
       - name: Prepare AAR Output Directory
         run: |
           mkdir -p android/app/libs
-          rm -f android/app/libs/mandala.aar  # 删除可能残留的旧文件
+          rm -f android/app/libs/mandala.aar # 删除可能残留的旧文件
           ls -la android/app/libs/
-
       - name: Build Core AAR
         working-directory: ./mandala-go
         run: |
@@ -49,11 +51,9 @@ jobs:
           rm -rf vendor
           go mod tidy
           go get -d golang.org/x/mobile@latest
-
           # 使用绝对路径避免相对路径问题（强烈推荐）
           gomobile bind -v -target=android -androidapi 21 \
             -o $(pwd)/../android/app/libs/mandala.aar ./mobile
-
       - name: Verify AAR Existence
         run: |
           echo "=== Contents of libs directory ==="
@@ -66,17 +66,14 @@ jobs:
             echo "AAR generation failed"
             exit 1
           fi
-
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.5'
-
       - name: Build with Gradle
         working-directory: ./android
         run: |
           ./gradlew assembleDebug --stacktrace --info --no-daemon
-
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
