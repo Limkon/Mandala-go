@@ -16,11 +16,11 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Install 32-bit libraries for AAPT2 (Ubuntu 24.04 final fix)
+      - name: Install libraries for AAPT2 (Ubuntu 24.04 ultimate fix)
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y libc6:i386 libstdc++6:i386 lib32z1
+          sudo apt-get install -y libc6:i386 libstdc++6:i386 lib32z1 zlib1g:i386
 
       - name: Setup Go
         uses: actions/setup-go@v5
