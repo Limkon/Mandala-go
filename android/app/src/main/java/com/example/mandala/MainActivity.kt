@@ -37,11 +37,12 @@ class MainActivity : ComponentActivity() {
     private var pendingConfigJson: String? = null
 
     // 注册 VPN 权限请求回调
+    // 当 VpnService.prepare() 返回 Intent 时，需要使用此 Launcher 启动系统授权弹窗
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
-            // 用户同意授权，启动服务
+            // 用户点击了“确定”，同意授权，现在可以启动服务了
             pendingConfigJson?.let { startVpnService(it) }
         } else {
             Toast.makeText(this, "需要 VPN 权限才能连接", Toast.LENGTH_SHORT).show()
@@ -53,10 +54,10 @@ class MainActivity : ComponentActivity() {
         
         setContent {
             MandalaTheme {
-                // 在 Compose 中获取 ViewModel (Factory 自动处理 AndroidViewModel)
+                // 在 Compose 中获取 ViewModel (Factory 会自动处理 AndroidViewModel)
                 val viewModel: MainViewModel = viewModel()
                 
-                // 监听 VPN 事件
+                // 监听 ViewModel 发出的 VPN 事件 (启动/停止)
                 LaunchedEffect(Unit) {
                     lifecycleScope.launch {
                         repeatOnLifecycle(Lifecycle.State.STARTED) {
@@ -70,38 +71,43 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                // 加载主界面 UI
                 MainApp(viewModel)
             }
         }
     }
 
+    // 准备启动 VPN：先检查是否有权限
     private fun prepareAndStartVpn(configJson: String) {
         pendingConfigJson = configJson
         
-        // 检查系统 VPN 权限
+        // 检查系统 VPN 权限，如果返回 null 表示已经有权限
         val intent = VpnService.prepare(this)
         if (intent != null) {
             // 需要请求权限，弹出系统对话框
             vpnPermissionLauncher.launch(intent)
         } else {
-            // 已有权限，直接启动
+            // 已有权限，直接启动服务
             startVpnService(configJson)
         }
     }
 
+    // 实际启动 VPN 服务 (前台服务)
     private fun startVpnService(configJson: String) {
         val intent = Intent(this, MandalaVpnService::class.java).apply {
             action = MandalaVpnService.ACTION_START
             putExtra(MandalaVpnService.EXTRA_CONFIG, configJson)
         }
-        startForegroundService(intent) // Android 8.0+ 必须用 startForegroundService
+        // Android 8.0+ 必须使用 startForegroundService 启动后台常驻服务
+        startForegroundService(intent)
         
-        // 通知 ViewModel 更新状态
-        // 实际开发中最好由 Service 发广播或 AIDL 通知 Activity，这里简化处理
+        // 通知 ViewModel 更新连接状态
+        // 实际项目中建议通过 BroadcastReceiver 或 AIDL 通信，这里简化处理
         val viewModel: MainViewModel = androidx.lifecycle.ViewModelProvider(this)[MainViewModel::class.java]
         viewModel.onVpnStarted()
     }
 
+    // 停止 VPN 服务
     private fun stopVpnService() {
         val intent = Intent(this, MandalaVpnService::class.java).apply {
             action = MandalaVpnService.ACTION_STOP
@@ -110,14 +116,13 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// MainApp 和 Scaffold 代码保持不变，省略以节省空间...
-// 请保留原有的 @Composable MainApp 代码
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainApp(viewModel: MainViewModel) {
-    // ... 复制原 MainApp 代码 ...
-    // 为了代码完整性，这里我简单复述一下结构
     val navController = rememberNavController()
+    
+    // 底部导航配置 - 使用中文标签
+    // Triple: (Label, Route, Icon)
     val navItems = listOf(
         Triple("首页", "Home", Icons.Filled.Home),
         Triple("节点", "Profiles", Icons.Filled.List),
@@ -129,6 +134,7 @@ fun MainApp(viewModel: MainViewModel) {
             NavigationBar {
                 val navBackStackEntry by navController.currentBackStackEntryAsState()
                 val currentRoute = navBackStackEntry?.destination?.route
+
                 navItems.forEach { (label, route, icon) ->
                     NavigationBarItem(
                         icon = { Icon(icon, contentDescription = label) },
@@ -136,7 +142,10 @@ fun MainApp(viewModel: MainViewModel) {
                         selected = currentRoute == route,
                         onClick = {
                             navController.navigate(route) {
-                                popUpTo(navController.graph.startDestinationId) { saveState = true }
+                                // 避免堆叠过多页面
+                                popUpTo(navController.graph.startDestinationId) {
+                                    saveState = true
+                                }
                                 launchSingleTop = true
                                 restoreState = true
                             }
@@ -146,9 +155,10 @@ fun MainApp(viewModel: MainViewModel) {
             }
         }
     ) { innerPadding ->
+        // 导航主机
         NavHost(
             navController = navController,
-            startDestination = "Home",
+            startDestination = "Home", // 路由 Key 保持英文
             modifier = Modifier.padding(innerPadding)
         ) {
             composable("Home") { HomeScreen(viewModel) }
