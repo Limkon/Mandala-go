@@ -40,7 +40,8 @@ jobs:
           echo "Building Mandala Core..."
           # 编译 Go 代码生成 .aar
           # 注意：输出路径直接指向 Android 项目的 libs 目录
-          gomobile bind -target=android -o ../android/app/libs/mandala.aar ./mobile
+          # 【修复】增加 -androidapi 21 以兼容 NDK 版本的最低 API 级别要求
+          gomobile bind -target=android -androidapi 21 -o ../android/app/libs/mandala.aar ./mobile
 
       # 6. 验证 AAR 是否生成 (用于调试)
       - name: Verify AAR Existence
