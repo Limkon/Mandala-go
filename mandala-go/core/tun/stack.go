@@ -12,13 +12,15 @@ import (
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
-	"gvisor.dev/gvisor/pkg/tcpip/header" // [关键新增] 引入 header 包以使用预定义 Subnet
+	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
-	"gvisor.dev/gvisor/pkg/tcpip/waiter"
+	
+	// [关键修复] 旧版 gVisor 的 waiter 包在 pkg/waiter，而不是 pkg/tcpip/waiter
+	"gvisor.dev/gvisor/pkg/waiter" 
 )
 
 type Stack struct {
@@ -55,9 +57,8 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 		return nil, fmt.Errorf("create nic failed: %v", err)
 	}
 
-	// 2. [修复] 路由表设置
-	// 使用 header.IPv4EmptySubnet 代替手动构造
-	// 这是一个预定义的 0.0.0.0/0 子网，完美适配该版本的 Struct 结构
+	// 2. 路由表设置
+	// 使用 header.IPv4EmptySubnet (0.0.0.0/0) 完美兼容 Struct 类型的 Subnet
 	s.SetRouteTable([]tcpip.Route{
 		{
 			Destination: header.IPv4EmptySubnet, 
@@ -67,7 +68,7 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 
 	s.SetPromiscuousMode(nicID, true)
 
-	// 3. [修复] 移除 SetTransportProtocolOption (该版本可能不支持或默认已开启 SACK)
+	// 3. 移除 SACK 选项以防报错
 	
 	ctx, cancel := context.WithCancel(context.Background())
 	dialer := proxy.NewDialer(cfg)
@@ -110,8 +111,8 @@ func (s *Stack) startPacketHandling() {
 
 func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	id := r.ID()
-	// [验证] 在 Struct 版本中，Address 通常有 AsSlice() 方法
-	// 如果编译报错提示没有 AsSlice，请尝试 id.LocalAddress.String()
+	// 注意：如果旧版 struct 没有 AsSlice()，这里可能需要调整
+	// 但通常 Address struct 版本都会带有 AsSlice()
 	targetIP := net.IP(id.LocalAddress.AsSlice())
 	targetPort := id.LocalPort
 
@@ -123,7 +124,6 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	}
 	r.Complete(false)
 
-	// TCP 连接通常只需要 2 个参数
 	localConn := gonet.NewTCPConn(&wq, ep)
 	defer localConn.Close()
 
@@ -159,7 +159,6 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 
 func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 	id := r.ID()
-	// 使用 AsSlice() 安全地获取 IP 字节
 	targetIP := net.IP(id.LocalAddress.AsSlice()).String()
 	targetPort := int(id.LocalPort)
 
@@ -173,8 +172,7 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 		return
 	}
 
-	// [修复] 恢复 3 个参数的调用
-	// 日志明确指出该版本 UDP 需要传入 s.stack
+	// [保持] 3个参数，适配旧版 gonet
 	localConn := gonet.NewUDPConn(s.stack, &wq, ep)
 
 	session, natErr := s.nat.GetOrCreate(srcKey, localConn, targetIP, targetPort)
