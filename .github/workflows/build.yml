@@ -34,20 +34,24 @@ jobs:
           go install golang.org/x/mobile/cmd/gomobile@latest
           gomobile init
 
-      # 5. 编译 Go 核心为 AAR (最终修复依赖问题 V3)
+      # 5. 编译 Go 核心为 AAR (最终修复：强制使用 Vendor 模式)
       - name: Build Core AAR
         working-directory: ./mandala-go
         run: |
           echo "Building Mandala Core..."
           
-          # 【最终修复】强制将 golang.org/x/mobile 模块添加为依赖，
-          # 解决 gobind 找不到 bind 库源码的问题。
+          # 【关键修复】强制将 gomobile 模块添加为依赖。
           go mod edit -require=golang.org/x/mobile@latest
           go mod tidy
           
+          # 【最终修复】执行 go mod vendor 将所有依赖源码下载到本地 vendor 目录。
+          # 这将解决 gobind 在 CI 环境中找不到依赖源码的问题。
+          go mod vendor
+          
           # 编译 Go 代码生成 .aar
           # 注意：输出路径直接指向 Android 项目的 libs 目录
-          gomobile bind -target=android -androidapi 21 -o ../android/app/libs/mandala.aar ./mobile
+          # 使用 -mod=vendor 强制工具链使用本地 vendor 目录
+          gomobile bind -target=android -androidapi 21 -mod=vendor -o ../android/app/libs/mandala.aar ./mobile
 
       # 6. 验证 AAR 是否生成 (用于调试)
       - name: Verify AAR Existence
