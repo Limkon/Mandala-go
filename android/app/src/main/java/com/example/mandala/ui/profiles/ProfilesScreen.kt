@@ -1,4 +1,4 @@
-// 文件路徑: android/app/src/main/java/com/example/mandala/ui/profiles/ProfilesScreen.kt
+// 文件路径: android/app/src/main/java/com/example/mandala/ui/profiles/ProfilesScreen.kt
 
 package com.example.mandala.ui.profiles
 
@@ -34,10 +34,10 @@ fun ProfilesScreen(viewModel: MainViewModel) {
     Scaffold(
         floatingActionButton = {
             FloatingActionButton(
-                onClick = { /* TODO: 新增節點邏輯 */ },
+                onClick = { /* TODO: 新增节点逻辑 */ },
                 containerColor = MaterialTheme.colorScheme.primary
             ) {
-                Icon(Icons.Default.Add, contentDescription = "Add Node")
+                Icon(Icons.Default.Add, contentDescription = "添加节点")
             }
         }
     ) { padding ->
@@ -48,7 +48,7 @@ fun ProfilesScreen(viewModel: MainViewModel) {
                 .fillMaxSize()
         ) {
             Text(
-                "Profiles", 
+                "节点列表", 
                 style = MaterialTheme.typography.headlineMedium, 
                 fontWeight = FontWeight.Bold
             )
@@ -85,7 +85,7 @@ fun NodeItem(node: Node, isSelected: Boolean, onClick: () -> Unit) {
             modifier = Modifier.padding(16.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // 協議圖標
+            // 协议图标
             Box(
                 modifier = Modifier
                     .size(48.dp)
@@ -104,7 +104,7 @@ fun NodeItem(node: Node, isSelected: Boolean, onClick: () -> Unit) {
 
             Spacer(modifier = Modifier.width(16.dp))
 
-            // 節點信息
+            // 节点信息
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     node.tag, 
@@ -118,23 +118,23 @@ fun NodeItem(node: Node, isSelected: Boolean, onClick: () -> Unit) {
                 )
             }
 
-            // 右側狀態
+            // 右侧状态
             if (isSelected) {
                 Icon(
                     Icons.Default.CheckCircle, 
-                    contentDescription = "Selected",
+                    contentDescription = "已选择",
                     tint = MaterialTheme.colorScheme.primary
                 )
             } else {
                 Icon(
                     Icons.Default.SignalCellularAlt, 
-                    contentDescription = "Ping",
+                    contentDescription = "测速",
                     tint = Color.Gray
                 )
             }
             
-            IconButton(onClick = { /* TODO: 編輯菜單 */ }) {
-                Icon(Icons.Default.MoreVert, contentDescription = "More", tint = Color.Gray)
+            IconButton(onClick = { /* TODO: 编辑菜单 */ }) {
+                Icon(Icons.Default.MoreVert, contentDescription = "更多", tint = Color.Gray)
             }
         }
     }
