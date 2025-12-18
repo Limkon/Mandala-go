@@ -42,17 +42,17 @@ android {
         kotlinCompilerExtensionVersion = "1.5.4"
     }
     
-    // [修复关键点] 配置打包选项以解决 NDK Strip 问题
+    // [修复 1] 配置打包选项以防止 NDK 缺失导致的 Strip 错误
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
         jniLibs {
-            // 使用旧版打包方式，增加兼容性
+            // 使用旧版打包方式以提高兼容性
             useLegacyPackaging = true
             
-            // 保持调试符号，跳过 strip 步骤
-            // 这对于没有安装 NDK 的 CI/CD 环境或本地环境至关重要
+            // 跳过 Strip 步骤，保留调试符号
+            // 解决 "Unable to strip library" 或 "NDK not configured" 错误
             keepDebugSymbols += setOf(
                 "*/armeabi-v7a/*.so",
                 "*/arm64-v8a/*.so",
@@ -67,12 +67,15 @@ dependencies {
     // 自动加载 libs 目录下的 mandala.aar (Go 编译产物)
     implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar"))))
 
+    // [修复 2] 添加 Gson 依赖 (解决 NodeParser.kt 编译错误)
+    implementation("com.google.code.gson:gson:2.10.1")
+
     // Android 核心库
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.6.2")
     implementation("androidx.activity:activity-compose:1.8.1")
     
-    // 添加 Google Material 库以支持 XML 中的 Theme.Material3
+    // Google Material 库
     implementation("com.google.android.material:material:1.11.0")
 
     // Compose UI 库 (使用 BOM 管理版本)
