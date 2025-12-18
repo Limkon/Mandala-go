@@ -1,3 +1,5 @@
+// 文件路径: mandala-go/core/tun/stack.go
+
 package tun
 
 import (
@@ -5,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"time" // [必须引入]
 
 	"mandala/core/config"
 	"mandala/core/protocol"
@@ -32,8 +35,7 @@ type Stack struct {
 }
 
 func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
-	// 验证标记，确保 CI 跑的是新代码
-	fmt.Println("DEBUG: Build Version 2025-Fixed-Import")
+	fmt.Println("DEBUG: Build Version 2025-Fixed-DNS-CN")
 
 	dev, err := NewDevice(fd, uint32(mtu))
 	if err != nil {
@@ -59,7 +61,6 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 	}
 
 	// 2. 路由表设置
-	// 使用 header.IPv4EmptySubnet (即 0.0.0.0/0)
 	s.SetRouteTable([]tcpip.Route{
 		{
 			Destination: header.IPv4EmptySubnet, 
@@ -156,9 +157,25 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 
 func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 	id := r.ID()
-	targetIP := net.IP(id.LocalAddress.AsSlice()).String()
 	targetPort := int(id.LocalPort)
 
+	// [关键修复] 拦截 DNS 请求 (Port 53)
+	// 直接在本地处理 DNS，绕过代理服务器，解决 UDP 转发不兼容导致的断网问题
+	if targetPort == 53 {
+		var wq waiter.Queue
+		ep, err := r.CreateEndpoint(&wq)
+		if err != nil {
+			return
+		}
+		// 创建本地 VPN 内的 UDP 连接
+		localConn := gonet.NewUDPConn(s.stack, &wq, ep)
+		
+		// 启动协程处理 DNS 转发
+		go s.handleLocalDNS(localConn)
+		return
+	}
+
+	targetIP := net.IP(id.LocalAddress.AsSlice()).String()
 	srcKey := fmt.Sprintf("%s:%d->%s:%d",
 		id.RemoteAddress.String(), id.RemotePort,
 		targetIP, targetPort)
@@ -169,7 +186,7 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 		return
 	}
 
-	// [重要] 3個參數，適配您鎖定的舊版 gVisor
+	// [重要] 3个参数，适配您锁定的旧版 gVisor
 	localConn := gonet.NewUDPConn(s.stack, &wq, ep)
 
 	session, natErr := s.nat.GetOrCreate(srcKey, localConn, targetIP, targetPort)
@@ -192,4 +209,47 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 			}
 		}
 	}()
+}
+
+// [新增] 本地 DNS 转发逻辑 (适配国内网络)
+// 这里的流量会因为 Android 侧的 addDisallowedApplication 而直接走物理 Wi-Fi/5G
+func (s *Stack) handleLocalDNS(conn *gonet.UDPConn) {
+	defer conn.Close()
+	
+	// 设置内部读取超时，防止协程泄露
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	buf := make([]byte, 1500) // 标准 MTU 大小
+	n, err := conn.Read(buf)
+	if err != nil {
+		return
+	}
+
+	// [修改] 使用国内 DNS (阿里 DNS) 以适应大陆网络
+	// 避免使用 8.8.8.8 被墙导致的超时
+	realDNS := "223.5.5.5:53"
+	
+	// 设置外部连接超时
+	dnsConn, err := net.DialTimeout("udp", realDNS, 2*time.Second)
+	if err != nil {
+		fmt.Printf("[DNS] Local dial to %s failed: %v\n", realDNS, err)
+		return
+	}
+	defer dnsConn.Close()
+
+	// 发送查询
+	if _, err := dnsConn.Write(buf[:n]); err != nil {
+		return
+	}
+
+	// 读取回复
+	dnsConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err = dnsConn.Read(buf)
+	if err != nil {
+		fmt.Printf("[DNS] Read from real DNS failed: %v\n", err)
+		return
+	}
+
+	// 将结果写回 VPN 内部
+	conn.Write(buf[:n])
 }
