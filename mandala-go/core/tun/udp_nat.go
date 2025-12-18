@@ -1,7 +1,7 @@
 package tun
 
 import (
-	"log" // 用於調試日誌
+	"log"
 	"net"
 	"strings"
 	"sync"
