@@ -68,7 +68,6 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 		return nil, fmt.Errorf("create nic failed: %v", err)
 	}
 
-	// 补全 IPv4 和 IPv6 路由
 	s.SetRouteTable([]tcpip.Route{
 		{Destination: header.IPv4EmptySubnet, NIC: nicID},
 		{Destination: header.IPv6EmptySubnet, NIC: nicID},
@@ -106,9 +105,7 @@ func (s *Stack) startPacketHandling() {
 
 func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("TCP Panic: %v", r)
-		}
+		if r := recover(); r != nil { log.Printf("TCP Panic: %v", r) }
 	}()
 
 	id := r.ID()
@@ -163,9 +160,7 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 
 func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("UDP Panic: %v", r)
-		}
+		if r := recover(); r != nil { log.Printf("UDP Panic: %v", r) }
 	}()
 
 	id := r.ID()
@@ -174,9 +169,7 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 	if targetPort == 53 {
 		var wq waiter.Queue
 		ep, err := r.CreateEndpoint(&wq)
-		if err != nil {
-			return
-		}
+		if err != nil { return }
 		localConn := gonet.NewUDPConn(s.stack, &wq, ep)
 		go s.handleLocalDNS(localConn)
 		return
@@ -187,9 +180,7 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 
 	var wq waiter.Queue
 	ep, err := r.CreateEndpoint(&wq)
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 
 	localConn := gonet.NewUDPConn(s.stack, &wq, ep)
 	session, natErr := s.nat.GetOrCreate(srcKey, localConn, targetIP, targetPort)
@@ -204,10 +195,8 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 		for {
 			localConn.SetDeadline(time.Now().Add(60 * time.Second))
 			n, rErr := localConn.Read(buf)
-			if rErr != nil {
-				return
-			}
-			session.RemoteConn.Write(buf[:n])
+			if rErr != nil { return }
+			if _, wErr := session.RemoteConn.Write(buf[:n]); wErr != nil { return }
 		}
 	}()
 }
@@ -217,15 +206,11 @@ func (s *Stack) handleLocalDNS(conn *gonet.UDPConn) {
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 	buf := make([]byte, 1500)
 	n, err := conn.Read(buf)
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 
 	realDNS := "223.5.5.5:53"
 	tcpConn, err := net.DialTimeout("tcp", realDNS, 3*time.Second)
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 	defer tcpConn.Close()
 
 	reqData := make([]byte, 2+n)
@@ -233,12 +218,14 @@ func (s *Stack) handleLocalDNS(conn *gonet.UDPConn) {
 	reqData[1] = byte(n)
 	copy(reqData[2:], buf[:n])
 
-	tcpConn.Write(reqData)
+	if _, err := tcpConn.Write(reqData); err != nil { return }
+
 	lenBuf := make([]byte, 2)
-	io.ReadFull(tcpConn, lenBuf)
+	if _, err := io.ReadFull(tcpConn, lenBuf); err != nil { return }
 	respLen := int(lenBuf[0])<<8 | int(lenBuf[1])
+
 	respBuf := make([]byte, respLen)
-	io.ReadFull(tcpConn, respBuf)
+	if _, err := io.ReadFull(tcpConn, respBuf); err != nil { return }
 	conn.Write(respBuf)
 }
 
