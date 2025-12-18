@@ -1,8 +1,9 @@
 package tun
 
 import (
-	"log" // [修改] 使用 log 替代 fmt
+	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,9 +14,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 )
 
-const (
-	udpTimeout = 60 * time.Second
-)
+const udpTimeout = 60 * time.Second
 
 type UDPSession struct {
 	LocalConn  *gonet.UDPConn
@@ -41,12 +40,9 @@ func NewUDPNatManager(dialer *proxy.Dialer, cfg *config.OutboundConfig) *UDPNatM
 func (m *UDPNatManager) GetOrCreate(key string, localConn *gonet.UDPConn, targetIP string, targetPort int) (*UDPSession, error) {
 	if val, ok := m.sessions.Load(key); ok {
 		session := val.(*UDPSession)
-
 		if session.LocalConn != localConn {
-			log.Printf("[NAT] Session stale for %s, recreating...", key)
 			session.RemoteConn.Close()
 			m.sessions.Delete(key)
-			// 继续创建新会话
 		} else {
 			session.LastActive = time.Now()
 			return session, nil
@@ -58,18 +54,25 @@ func (m *UDPNatManager) GetOrCreate(key string, localConn *gonet.UDPConn, target
 		return nil, err
 	}
 
-	// [协议适配] 发送 UDP 握手包
-	if m.config.Type == "mandala" {
+	var payload []byte
+	var hErr error
+	switch strings.ToLower(m.config.Type) {
+	case "mandala":
 		client := protocol.NewMandalaClient(m.config.Username, m.config.Password)
-		payload, err := client.BuildHandshakePayload(targetIP, targetPort)
-		if err != nil {
-			remoteConn.Close()
-			return nil, err
-		}
-		if _, err := remoteConn.Write(payload); err != nil {
-			remoteConn.Close()
-			return nil, err
-		}
+		payload, hErr = client.BuildHandshakePayload(targetIP, targetPort)
+	case "trojan":
+		payload, hErr = protocol.BuildTrojanPayload(m.config.Password, targetIP, targetPort)
+	case "vless":
+		payload, hErr = protocol.BuildVlessPayload(m.config.UUID, targetIP, targetPort)
+	}
+
+	if hErr != nil {
+		remoteConn.Close()
+		return nil, hErr
+	}
+
+	if len(payload) > 0 {
+		remoteConn.Write(payload)
 	}
 
 	session := &UDPSession{
@@ -80,8 +83,6 @@ func (m *UDPNatManager) GetOrCreate(key string, localConn *gonet.UDPConn, target
 
 	m.sessions.Store(key, session)
 	go m.copyRemoteToLocal(key, session)
-
-	log.Printf("[NAT] New UDP Session: %s", key)
 	return session, nil
 }
 
@@ -90,22 +91,13 @@ func (m *UDPNatManager) copyRemoteToLocal(key string, s *UDPSession) {
 		s.RemoteConn.Close()
 		m.sessions.Delete(key)
 	}()
-
 	buf := make([]byte, 4096)
 	for {
 		s.RemoteConn.SetReadDeadline(time.Now().Add(udpTimeout))
 		n, err := s.RemoteConn.Read(buf)
-		if err != nil {
-			// log.Printf("[NAT] Remote read error/timeout: %v", err)
-			return
-		}
-
+		if err != nil { return }
 		s.LastActive = time.Now()
-		
-		if _, err := s.LocalConn.Write(buf[:n]); err != nil {
-			log.Printf("[NAT] Write to Local Stack failed: %v", err)
-			return
-		}
+		s.LocalConn.Write(buf[:n])
 	}
 }
 
@@ -116,7 +108,6 @@ func (m *UDPNatManager) cleanupLoop() {
 		m.sessions.Range(func(key, value interface{}) bool {
 			session := value.(*UDPSession)
 			if now.Sub(session.LastActive) > udpTimeout {
-				// log.Printf("[NAT] Session timeout: %s", key)
 				session.RemoteConn.Close()
 				m.sessions.Delete(key)
 			}
