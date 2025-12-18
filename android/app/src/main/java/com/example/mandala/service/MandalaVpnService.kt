@@ -63,12 +63,12 @@ class MandalaVpnService : VpnService() {
                 .addAddress(VPN_ADDRESS, 24)
                 .addRoute(VPN_ROUTE, 0)
                 .setMtu(VPN_MTU)
-                // 建议: 添加 DNS 服务器，防止 DNS 泄露或无法解析
+                // 依然配置 8.8.8.8，但实际上会被 Go 层拦截并转发给国内 DNS
                 .addDnsServer("8.8.8.8") 
                 .addDnsServer("1.1.1.1")
 
-            // [关键修复] 排除本应用自身的流量，防止死循环！
-            // 这样 Go 核心发出的代理请求会直接走物理网络（WiFi/4G），而不是重新进入 VPN
+            // [关键修复] 排除本应用，防止死循环！
+            // 确保 Go 核心发出的 socket 请求直接走物理网络（WiFi/4G），而不是重新进入 VPN
             try {
                 builder.addDisallowedApplication(packageName)
             } catch (e: Exception) {
@@ -91,9 +91,7 @@ class MandalaVpnService : VpnService() {
             // --- 步骤 B: 启动 Go 核心 (tun2socks 模式) ---
             Log.d("MandalaVpn", "2. 正在启动 Go 核心...")
             
-            // [修复] Go 端 StartVpn(fd int32, mtu int32, ...)
             // Java 端对应: startVpn(int, int, String)
-            // 直接传入 fd (Int) 和 VPN_MTU (Int)
             val err = Mobile.startVpn(fd, VPN_MTU, configJson)
             
             if (err.isNotEmpty()) {
