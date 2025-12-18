@@ -17,7 +17,6 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-       
         vectorDrawables {
             useSupportLibrary = true
         }
@@ -42,9 +41,24 @@ android {
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.4"
     }
+    
+    // [修复关键点] 配置打包选项以解决 NDK Strip 问题
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+        jniLibs {
+            // 使用旧版打包方式，增加兼容性
+            useLegacyPackaging = true
+            
+            // 保持调试符号，跳过 strip 步骤
+            // 这对于没有安装 NDK 的 CI/CD 环境或本地环境至关重要
+            keepDebugSymbols += setOf(
+                "*/armeabi-v7a/*.so",
+                "*/arm64-v8a/*.so",
+                "*/x86/*.so",
+                "*/x86_64/*.so"
+            )
         }
     }
 }
@@ -58,7 +72,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.6.2")
     implementation("androidx.activity:activity-compose:1.8.1")
     
-    // [修复关键点] 添加 Google Material 库以支持 XML 中的 Theme.Material3
+    // 添加 Google Material 库以支持 XML 中的 Theme.Material3
     implementation("com.google.android.material:material:1.11.0")
 
     // Compose UI 库 (使用 BOM 管理版本)
@@ -67,7 +81,7 @@ dependencies {
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
-    
+  
     // 扩展图标库 (Settings/Home 图标需要)
     implementation("androidx.compose.material:material-icons-extended")
     
