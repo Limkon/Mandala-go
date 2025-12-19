@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import mobile.Mobile
 
+// 节点数据模型
 data class Node(
     val tag: String,
     val protocol: String,
@@ -29,15 +30,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _isConnected = MutableStateFlow(false)
     val isConnected = _isConnected.asStateFlow()
 
-    private val _logs = MutableStateFlow(listOf("[系統] 準備就緒"))
+    private val _logs = MutableStateFlow(listOf("[系统] 准备就绪"))
     val logs = _logs.asStateFlow()
 
     private val _nodes = MutableStateFlow<List<Node>>(emptyList())
     val nodes = _nodes.asStateFlow()
 
-    private val _currentNode = MutableStateFlow(Node("未選擇", "none", "0.0.0.0", 0))
+    private val _currentNode = MutableStateFlow(Node("未选择", "none", "0.0.0.0", 0))
     val currentNode = _currentNode.asStateFlow()
 
+    // VPN 事件通道，用于通知 Service
     sealed class VpnEvent {
         data class StartVpn(val configJson: String) : VpnEvent()
         object StopVpn : VpnEvent()
@@ -50,7 +52,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _isConnected.value = Mobile.isRunning()
     }
 
-    private fun refreshNodes() {
+    fun refreshNodes() {
         viewModelScope.launch {
             val saved = repository.loadNodes()
             _nodes.value = saved
@@ -64,10 +66,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             if (_isConnected.value) {
                 _vpnEventChannel.send(VpnEvent.StopVpn)
+                addLog("[系统] 正在请求停止服务...")
             } else {
                 if (_currentNode.value.protocol != "none") {
                     val json = generateConfigJson(_currentNode.value)
                     _vpnEventChannel.send(VpnEvent.StartVpn(json))
+                    addLog("[系统] 正在发起连接: ${_currentNode.value.tag}")
+                } else {
+                    addLog("[系统] 请先选择一个有效节点")
                 }
             }
         }
@@ -75,31 +81,41 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun selectNode(node: Node) {
         _currentNode.value = node
-        addLog("[系統] 切換至: ${node.tag}")
+        addLog("[系统] 切换到节点: ${node.tag}")
     }
 
-    // 修復：補全 MainActivity 調用的方法
+    // VPN 启动成功回调
     fun onVpnStarted() {
         _isConnected.value = true
-        addLog("[核心] 隧道已建立")
+        addLog("[核心] VPN 隧道已建立")
     }
 
+    // VPN 停止回调
     fun onVpnStopped() {
         _isConnected.value = false
-        addLog("[核心] 隧道已關閉")
+        addLog("[核心] VPN 隧道已关闭")
     }
 
-    // 修復：補全 ProfilesScreen 調用的導入方法
-    fun importFromText(text: String) {
+    // 从文本导入节点
+    fun importFromText(text: String, onResult: (Boolean, String) -> Unit) {
         val node = NodeParser.parse(text)
         if (node != null) {
             viewModelScope.launch {
-                repository.saveNodes(_nodes.value + node)
+                val currentList = _nodes.value.toMutableList()
+                // 检查重复
+                if (currentList.any { it.server == node.server && it.port == node.port }) {
+                    onResult(false, "该节点已存在")
+                    return@launch
+                }
+                currentList.add(node)
+                repository.saveNodes(currentList)
                 refreshNodes()
-                addLog("[系統] 導入成功: ${node.tag}")
+                addLog("[系统] 成功导入节点: ${node.tag}")
+                onResult(true, "导入成功")
             }
         } else {
-            addLog("[錯誤] 無效的連結格式")
+            addLog("[错误] 不支持的链接格式")
+            onResult(false, "导入失败：链接格式无效")
         }
     }
 
@@ -110,8 +126,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _logs.value = current
     }
 
+    // 动态生成 Go 核心所需的 JSON 配置
     private fun generateConfigJson(node: Node): String {
         val useTls = node.protocol != "socks" && node.protocol != "shadowsocks"
+        val sniValue = if (node.sni.isEmpty()) node.server else node.sni
+        
         return """
         {
             "tag": "${node.tag}",
@@ -120,8 +139,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             "server_port": ${node.port},
             "password": "${node.password}",
             "uuid": "${node.uuid}",
-            "tls": { "enabled": $useTls, "server_name": "${if(node.sni.isEmpty()) node.server else node.sni}" },
-            "transport": { "type": "${node.transport}", "path": "${node.path}" }
+            "tls": { 
+                "enabled": $useTls, 
+                "server_name": "$sniValue",
+                "insecure": true 
+            },
+            "transport": { 
+                "type": "${node.transport}", 
+                "path": "${node.path}" 
+            }
         }
         """.trimIndent()
     }
