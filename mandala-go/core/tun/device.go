@@ -46,7 +46,7 @@ func (d *Device) LinkEndpoint() stack.LinkEndpoint {
 		
 		// 关键配置组：
 		EthernetHeader:    false, // 确保是 TUN 模式而非 TAP
-		PacketInfo:        false, // Android 不使用 PI 头
+		// PacketInfo:     false, // [已删除] 旧版 gVisor 不支持此字段，删除以修复编译错误
 		RXChecksumOffload: false, // 关闭接收卸载
 		TXChecksumOffload: false, // 关闭发送卸载 (强制 gVisor 计算 Checksum)
 	})
