@@ -3,8 +3,56 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
-    name: Build Go Core & Android APK
+  # 作业 1: 构建 Go 核心库
+  build-core:
+    name: Build Go Core (AAR)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # 设置 Go 环境并开启模块缓存
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+          # 指定 go.sum 路径以确保缓存键值正确
+          cache-dependency-path: mandala-go/go.sum
+
+      - name: Install Gomobile Toolchain
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+          $(go env GOPATH)/bin/gomobile init
+
+      - name: Prepare AAR Output Directory
+        run: |
+          mkdir -p android/app/libs
+          rm -f android/app/libs/mandala.aar
+
+      - name: Build Core AAR
+        working-directory: ./mandala-go
+        run: |
+          echo "Building Mandala Core..."
+          go mod tidy
+          gomobile bind -v -target=android -androidapi 21 \
+            -ldflags="-s -w" \
+            -o ../android/app/libs/mandala.aar ./mobile
+
+      # 上传 AAR 作为工件，供后续作业使用
+      - name: Upload AAR Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mandala-library
+          path: android/app/libs/mandala.aar
+          retention-days: 1
+
+  # 作业 2: 构建 Android APP (依赖 build-core)
+  build-app:
+    name: Build Android APK
+    needs: build-core  # 关键：等待核心库构建完成
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -22,50 +70,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libc6:i386 libstdc++6:i386 lib32z1 zlib1g:i386
 
-      # [修復] 升級到穩定版 Go 1.23，以支持最新 Gomobile
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      # 下载上一步生成的 AAR
+      - name: Download AAR Artifact
+        uses: actions/download-artifact@v4
         with:
-          go-version: '1.23'
-          cache: true
+          name: mandala-library
+          path: android/app/libs
 
-      - name: Install Gomobile Toolchain
-        run: |
-          # 安裝指定版本的 Gomobile，防止版本衝突
-          go install golang.org/x/mobile/cmd/gomobile@latest
-          go install golang.org/x/mobile/cmd/gobind@latest
-          
-          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
-          # 初始化環境
-          $(go env GOPATH)/bin/gomobile init
-
-      - name: Prepare AAR Output Directory
-        run: |
-          mkdir -p android/app/libs
-          rm -f android/app/libs/mandala.aar
-
-      - name: Build Core AAR
-        working-directory: ./mandala-go
-        run: |
-          echo "Building Mandala Core..."
-          # 確保依賴同步
-          go mod tidy
-          
-          # 執行編譯
-          gomobile bind -v -target=android -androidapi 21 \
-            -ldflags="-s -w" \
-            -o ../android/app/libs/mandala.aar ./mobile
-
-      - name: Verify AAR Existence
-        run: |
-          ls -lh android/app/libs/
-          if [ -f android/app/libs/mandala.aar ]; then
-            echo "AAR generated successfully!"
-          else
-            echo "AAR generation failed"
-            exit 1
-          fi
-
+      # 设置 Gradle (setup-gradle 自动包含缓存功能)
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
         with:
