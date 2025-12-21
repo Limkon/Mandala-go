@@ -7,7 +7,7 @@ import (
 	"log"
 	"net"
 	"strings"
-	"sync" // [新增] 用于 sync.Once
+	"sync" // [必须] 用于 sync.Once
 	"time"
 
 	"mandala/core/config"
@@ -37,7 +37,7 @@ type Stack struct {
 	nat       *UDPNatManager
 	ctx       context.Context
 	cancel    context.CancelFunc
-	closeOnce sync.Once // [新增] 确保只关闭一次，防止 Panic
+	closeOnce sync.Once // 防止重复关闭
 }
 
 func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
@@ -65,7 +65,7 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 
 	nicID := tcpip.NICID(1)
 	
-	// [修复] 直接使用 dev.LinkEndpoint()，移除了未使用的 sniffer 包引用
+	// [修复] 直接使用 dev.LinkEndpoint()，避免未使用的包引用错误
 	if err := s.CreateNIC(nicID, dev.LinkEndpoint()); err != nil {
 		dev.Close()
 		return nil, fmt.Errorf("创建网卡失败: %v", err)
@@ -121,7 +121,6 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	// 1. 拨号代理
 	remoteConn, dialErr := s.dialer.Dial()
 	if dialErr != nil {
-		// log.Printf("[TCP] Dial失败: %v", dialErr) // 可选日志
 		r.Complete(true)
 		return
 	}
@@ -190,9 +189,8 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 		return
 	}
 
-	// [关键] 必须使用 net 包，否则编译会报错 "net imported and not used"
+	// [关键] 使用 net.IP 确保 net 包被引用，避免 "imported and not used"
 	targetIP := net.IP(id.LocalAddress.AsSlice()).String()
-	
 	srcKey := fmt.Sprintf("%s:%d->%s:%d", id.RemoteAddress.String(), id.RemotePort, targetIP, targetPort)
 
 	var wq waiter.Queue
@@ -237,7 +235,7 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 	}
 	defer proxyConn.Close()
 
-	// 2. 发送握手 (固定转发到 Google DNS 8.8.8.8:53)
+	// 2. 发送握手 (固定转发到 8.8.8.8)
 	var payload []byte
 	switch strings.ToLower(s.config.Type) {
 	case "mandala":
@@ -251,7 +249,7 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 	
 	if _, err := proxyConn.Write(payload); err != nil { return }
 
-	// 3. 封装 DNS 请求为 TCP (2字节长度头 + 数据)
+	// 3. 封装 DNS (2字节长度 + 数据)
 	reqData := make([]byte, 2+n)
 	reqData[0] = byte(n >> 8)
 	reqData[1] = byte(n)
@@ -269,31 +267,31 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 
 	// 5. 写回 Android
 	conn.Write(respBuf)
-	log.Printf("[DNS] 代理解析完成")
+	log.Printf("[DNS] 解析完成")
 }
 
-// [修复] 线程安全的 Close 方法，防止重复关闭导致的 Panic
+// [修改] 移除 CloseNIC，修复编译错误
 func (s *Stack) Close() {
 	s.closeOnce.Do(func() {
 		log.Println("[Stack] Stopping...")
 		
-		// 1. 取消 Context 通知所有子协程退出
+		// 1. 取消 Context
 		if s.cancel != nil {
 			s.cancel()
 		}
 		
-		// 2. 稍微等待资源释放
+		// 2. 等待资源释放
 		time.Sleep(100 * time.Millisecond)
 
-		// 3. 关闭设备文件描述符
+		// 3. 关闭文件描述符
 		if s.device != nil {
 			s.device.Close()
 		}
 		
-		// 4. 关闭 gVisor 协议栈
+		// 4. 关闭协议栈
 		if s.stack != nil {
-			s.stack.CloseNIC(1) // 关闭网卡
-			s.stack.Close()     // 关闭栈
+			// s.stack.CloseNIC(1) // [删除] 此行导致编译错误
+			s.stack.Close()     // 保留此行
 		}
 		
 		log.Println("[Stack] Stopped.")
