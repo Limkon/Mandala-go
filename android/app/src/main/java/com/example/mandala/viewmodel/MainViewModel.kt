@@ -11,7 +11,7 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import mobile.Mobile
 
-// [新增] 多语言字符串封装
+// [修改] 多语言字符串封装，增加编辑/删除相关字段
 data class AppStrings(
     val home: String,
     val profiles: String,
@@ -40,7 +40,18 @@ data class AppStrings(
     val language: String,
     val about: String,
     val confirm: String,
-    val cancel: String
+    val cancel: String,
+    // 新增字段
+    val edit: String,
+    val delete: String,
+    val save: String,
+    val deleteConfirm: String,
+    val tag: String,
+    val address: String,
+    val port: String,
+    val password: String,
+    val uuid: String,
+    val sni: String
 )
 
 val ChineseStrings = AppStrings(
@@ -57,7 +68,12 @@ val ChineseStrings = AppStrings(
     randomPadding = "随机填充", randomPaddingDesc = "向数据包添加随机噪音",
     localPort = "本地监听端口",
     appSettings = "应用设置", theme = "主题", language = "语言",
-    about = "关于", confirm = "确定", cancel = "取消"
+    about = "关于", confirm = "确定", cancel = "取消",
+    // 新增
+    edit = "编辑", delete = "删除", save = "保存",
+    deleteConfirm = "确定要删除此节点吗？",
+    tag = "备注", address = "地址", port = "端口",
+    password = "密码", uuid = "UUID", sni = "SNI (域名)"
 )
 
 val EnglishStrings = AppStrings(
@@ -74,7 +90,12 @@ val EnglishStrings = AppStrings(
     randomPadding = "Random Padding", randomPaddingDesc = "Add random noise to packets",
     localPort = "Local Port",
     appSettings = "App Settings", theme = "Theme", language = "Language",
-    about = "About", confirm = "OK", cancel = "Cancel"
+    about = "About", confirm = "OK", cancel = "Cancel",
+    // 新增
+    edit = "Edit", delete = "Delete", save = "Save",
+    deleteConfirm = "Are you sure you want to delete this node?",
+    tag = "Tag", address = "Address", port = "Port",
+    password = "Password", uuid = "UUID", sni = "SNI"
 )
 
 data class Node(
@@ -124,23 +145,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _randomPadding = MutableStateFlow(prefs.getBoolean("random_padding", false))
     val randomPadding = _randomPadding.asStateFlow()
 
-    // [新增] 本地端口
     private val _localPort = MutableStateFlow(prefs.getInt("local_port", 10809))
     val localPort = _localPort.asStateFlow()
 
-    // [新增] 主题
     private val _themeMode = MutableStateFlow(
         AppThemeMode.values()[prefs.getInt("theme_mode", AppThemeMode.SYSTEM.ordinal)]
     )
     val themeMode = _themeMode.asStateFlow()
 
-    // [新增] 语言
     private val _language = MutableStateFlow(
         AppLanguage.values()[prefs.getInt("app_language", AppLanguage.CHINESE.ordinal)]
     )
     val language = _language.asStateFlow()
 
-    // [新增] 当前语言字符串流
     val appStrings = _language.map { 
         if (it == AppLanguage.ENGLISH) EnglishStrings else ChineseStrings 
     }.stateIn(viewModelScope, SharingStarted.Eagerly, ChineseStrings)
@@ -168,7 +185,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // [新增] 更新端口设置
+    // 更新端口设置
     fun updateLocalPort(port: String) {
         val p = port.toIntOrNull()
         if (p != null && p in 1024..65535) {
@@ -177,13 +194,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // [新增] 更新主题
+    // 更新主题
     fun updateTheme(mode: AppThemeMode) {
         prefs.edit().putInt("theme_mode", mode.ordinal).apply()
         _themeMode.value = mode
     }
 
-    // [新增] 更新语言
+    // 更新语言
     fun updateLanguage(lang: AppLanguage) {
         prefs.edit().putInt("app_language", lang.ordinal).apply()
         _language.value = lang
@@ -193,6 +210,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val saved = repository.loadNodes()
             _nodes.value = saved
+            // 如果列表不为空且当前未选择节点，默认选择第一个
             if (saved.isNotEmpty() && _currentNode.value.protocol == "none") {
                 _currentNode.value = saved[0]
             }
@@ -203,7 +221,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             if (_isConnected.value) {
                 _vpnEventChannel.send(VpnEvent.StopVpn)
-                // 状态不立即改变，等待 Service 通知
                 addLog("[系统] 正在断开...")
             } else {
                 if (_currentNode.value.protocol != "none") {
@@ -220,6 +237,50 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun selectNode(node: Node) {
         _currentNode.value = node
         addLog("[系统] 已选择: ${node.tag}")
+    }
+
+    // [新增] 删除节点
+    fun deleteNode(node: Node) {
+        viewModelScope.launch {
+            val currentList = _nodes.value.toMutableList()
+            // 简单对象比较，如果有唯一 ID 更好，但这里用数据类相等性即可
+            currentList.remove(node)
+            repository.saveNodes(currentList)
+            
+            // 如果删除的是当前选中的节点，重置选中状态
+            if (_currentNode.value == node) {
+                 if (currentList.isNotEmpty()) {
+                     _currentNode.value = currentList[0]
+                 } else {
+                     _currentNode.value = Node("未选择", "none", "0.0.0.0", 0)
+                 }
+                 // 如果正在连接，可能需要断开，这里暂不强制断开，仅更新 UI 状态
+            }
+            
+            _nodes.value = currentList
+            addLog("[系统] 已删除: ${node.tag}")
+        }
+    }
+
+    // [新增] 更新节点
+    fun updateNode(oldNode: Node, newNode: Node) {
+        viewModelScope.launch {
+            val currentList = _nodes.value.toMutableList()
+            val index = currentList.indexOf(oldNode)
+            if (index != -1) {
+                currentList[index] = newNode
+                repository.saveNodes(currentList)
+                
+                // 如果更新的是当前选中的节点，需要同步更新选中状态
+                if (_currentNode.value == oldNode) {
+                    _currentNode.value = newNode
+                    // 如果正在运行，配置不会实时生效，需要重连
+                }
+                
+                _nodes.value = currentList
+                addLog("[系统] 已更新: ${newNode.tag}")
+            }
+        }
     }
 
     fun onVpnStarted() {
