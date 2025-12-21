@@ -26,12 +26,13 @@ import com.example.mandala.viewmodel.Node
 fun ProfilesScreen(viewModel: MainViewModel) {
     val nodes by viewModel.nodes.collectAsState()
     val currentNode by viewModel.currentNode.collectAsState()
+    val strings by viewModel.appStrings.collectAsState() // 获取多语言
     val context = LocalContext.current
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("节点管理") },
+                title = { Text(strings.nodeManagement) },
                 actions = {
                     IconButton(onClick = {
                         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -39,13 +40,14 @@ fun ProfilesScreen(viewModel: MainViewModel) {
                         if (clipData != null && clipData.itemCount > 0) {
                             val text = clipData.getItemAt(0).text.toString()
                             viewModel.importFromText(text) { success, message ->
+                                // 这里的 message 来自 ViewModel，暂未多语言化，直接显示
                                 Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
                             }
                         } else {
-                            Toast.makeText(context, "剪贴板为空", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, strings.clipboardEmpty, Toast.LENGTH_SHORT).show()
                         }
                     }) {
-                        Icon(Icons.Default.ContentPaste, contentDescription = "粘贴导入")
+                        Icon(Icons.Default.ContentPaste, contentDescription = strings.importFromClipboard)
                     }
                 }
             )
@@ -53,7 +55,7 @@ fun ProfilesScreen(viewModel: MainViewModel) {
     ) { padding ->
         if (nodes.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
-                Text("暂无节点，请从剪贴板导入")
+                Text(strings.importFromClipboard + "...")
             }
         } else {
             LazyColumn(modifier = Modifier.fillMaxSize().padding(padding)) {
