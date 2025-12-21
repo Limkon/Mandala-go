@@ -37,7 +37,7 @@ type Stack struct {
 	nat       *UDPNatManager
 	ctx       context.Context
 	cancel    context.CancelFunc
-	closeOnce sync.Once // 防止重复关闭
+	closeOnce sync.Once
 }
 
 func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
@@ -59,7 +59,6 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 		},
 	})
 
-	// 开启转发
 	s.SetForwardingDefaultAndAllNICs(ipv4.ProtocolNumber, true)
 	s.SetForwardingDefaultAndAllNICs(ipv6.ProtocolNumber, true)
 
@@ -70,7 +69,6 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 		return nil, fmt.Errorf("创建网卡失败: %v", err)
 	}
 
-	// 开启 IP 欺骗 (Spoofing)
 	s.SetPromiscuousMode(nicID, true)
 	s.SetSpoofing(nicID, true)
 
@@ -97,13 +95,11 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 }
 
 func (s *Stack) startPacketHandling() {
-	// TCP 处理
 	tcpHandler := tcp.NewForwarder(s.stack, 30000, 10, func(r *tcp.ForwarderRequest) {
 		go s.handleTCP(r)
 	})
 	s.stack.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpHandler.HandlePacket)
 
-	// UDP 处理
 	udpHandler := udp.NewForwarder(s.stack, func(r *udp.ForwarderRequest) {
 		s.handleUDP(r)
 	})
@@ -132,8 +128,6 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	var hErr error
 	targetHost := id.LocalAddress.String()
 	targetPort := int(id.LocalPort)
-
-	// 标记是否需要 VLESS 响应处理
 	isVless := false
 
 	switch strings.ToLower(s.config.Type) {
@@ -145,6 +139,14 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	case "vless":
 		payload, hErr = protocol.BuildVlessPayload(s.config.UUID, targetHost, targetPort)
 		isVless = true
+
+	// [新增] Shadowsocks
+	case "shadowsocks":
+		payload, hErr = protocol.BuildShadowsocksPayload(targetHost, targetPort)
+
+	// [新增] SOCKS5 (交互式握手，无 Payload 生成)
+	case "socks", "socks5":
+		hErr = protocol.HandshakeSocks5(remoteConn, s.config.Username, s.config.Password, targetHost, targetPort)
 	}
 
 	if hErr != nil {
@@ -152,6 +154,7 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 		return
 	}
 
+	// 发送握手包 (适用于 Mandala, Trojan, Vless, Shadowsocks)
 	if len(payload) > 0 {
 		if _, err := remoteConn.Write(payload); err != nil {
 			r.Complete(true)
@@ -159,7 +162,7 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 		}
 	}
 
-	// [新增] 如果是 VLESS，包装连接以剥离响应头
+	// 如果是 VLESS，应用响应头剥离器
 	if isVless {
 		remoteConn = protocol.NewVlessConn(remoteConn)
 	}
@@ -254,7 +257,7 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 	}
 	defer proxyConn.Close()
 
-	// 2. 发送握手 (固定转发到 8.8.8.8)
+	// 2. 发送握手
 	var payload []byte
 	isVless := false
 
@@ -267,19 +270,30 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 	case "vless":
 		payload, _ = protocol.BuildVlessPayload(s.config.UUID, "8.8.8.8", 53)
 		isVless = true
+
+	// [新增] Shadowsocks
+	case "shadowsocks":
+		payload, _ = protocol.BuildShadowsocksPayload("8.8.8.8", 53)
+
+	// [新增] SOCKS5
+	case "socks", "socks5":
+		if err := protocol.HandshakeSocks5(proxyConn, s.config.Username, s.config.Password, "8.8.8.8", 53); err != nil {
+			log.Printf("[DNS] Socks5握手失败: %v", err)
+			return
+		}
 	}
 
-	if _, err := proxyConn.Write(payload); err != nil {
-		return
+	if len(payload) > 0 {
+		if _, err := proxyConn.Write(payload); err != nil {
+			return
+		}
 	}
 
-	// 如果是 VLESS DNS 连接，也需要包装以剥离响应头
 	if isVless {
-		// 注意：此处 proxyConn 是 net.Conn 接口，需要 reassignment
 		proxyConn = protocol.NewVlessConn(proxyConn)
 	}
 
-	// 3. 封装 DNS (2字节长度 + 数据)
+	// 3. 封装 DNS
 	reqData := make([]byte, 2+n)
 	reqData[0] = byte(n >> 8)
 	reqData[1] = byte(n)
