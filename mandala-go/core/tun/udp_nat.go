@@ -68,6 +68,14 @@ func (m *UDPNatManager) GetOrCreate(key string, localConn *gonet.UDPConn, target
 	case "vless":
 		payload, hErr = protocol.BuildVlessPayload(m.config.UUID, targetIP, targetPort)
 		isVless = true
+
+	// [新增] Shadowsocks
+	case "shadowsocks":
+		payload, hErr = protocol.BuildShadowsocksPayload(targetIP, targetPort)
+
+	// [新增] SOCKS5
+	case "socks", "socks5":
+		hErr = protocol.HandshakeSocks5(remoteConn, m.config.Username, m.config.Password, targetIP, targetPort)
 	}
 
 	if hErr != nil {
@@ -82,7 +90,6 @@ func (m *UDPNatManager) GetOrCreate(key string, localConn *gonet.UDPConn, target
 		}
 	}
 
-	// [新增] 如果是 VLESS，包装连接以剥离响应头
 	if isVless {
 		remoteConn = protocol.NewVlessConn(remoteConn)
 	}
