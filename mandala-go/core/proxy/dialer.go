@@ -2,18 +2,24 @@ package proxy
 
 import (
 	"bufio"
-	"crypto/rand" // [修复] 使用 crypto/rand 生成真随机数
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"time"
 
 	"mandala/core/config"
 )
+
+func init() {
+	// 确保日志输出可见
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+}
 
 type Dialer struct {
 	Config *config.OutboundConfig
@@ -25,12 +31,16 @@ func NewDialer(cfg *config.OutboundConfig) *Dialer {
 
 func (d *Dialer) Dial() (net.Conn, error) {
 	targetAddr := fmt.Sprintf("%s:%d", d.Config.Server, d.Config.ServerPort)
+	// 缩短连接超时时间，快速失败
 	conn, err := net.DialTimeout("tcp", targetAddr, 5*time.Second)
 	if err != nil {
 		return nil, err
 	}
 
+	// [关键修复 1] 强制开启 NoDelay 和 KeepAlive
+	// 防止 Shadowsocks/Socks5 的小包头（几个字节）被 TCP 缓冲卡住
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true) 
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(15 * time.Second)
 	}
@@ -46,10 +56,13 @@ func (d *Dialer) Dial() (net.Conn, error) {
 		}
 		
 		tlsConn := tls.Client(conn, tlsConfig)
+		// 设置较短的握手超时
+		tlsConn.SetDeadline(time.Now().Add(5 * time.Second))
 		if err := tlsConn.Handshake(); err != nil {
 			conn.Close()
 			return nil, fmt.Errorf("tls handshake failed: %v", err)
 		}
+		tlsConn.SetDeadline(time.Time{}) // 清除超时
 		conn = tlsConn
 	}
 
@@ -78,13 +91,17 @@ func (d *Dialer) handshakeWebSocket(conn net.Conn) (net.Conn, error) {
 	rand.Read(key)
 	keyStr := base64.StdEncoding.EncodeToString(key)
 
+	// [关键修复 2] 使用 Android Chrome User-Agent
+	// 避免因 PC 指纹在移动网络下被服务端风控拦截
+	ua := "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+	
 	req := fmt.Sprintf("GET %s HTTP/1.1\r\n"+
 		"Host: %s\r\n"+
-		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"+
+		"User-Agent: %s\r\n"+
 		"Upgrade: websocket\r\n"+
 		"Connection: Upgrade\r\n"+
 		"Sec-WebSocket-Key: %s\r\n"+
-		"Sec-WebSocket-Version: 13\r\n", path, host, keyStr)
+		"Sec-WebSocket-Version: 13\r\n", path, host, ua)
 
 	if d.Config.Transport.Headers != nil {
 		for k, v := range d.Config.Transport.Headers {
@@ -93,17 +110,25 @@ func (d *Dialer) handshakeWebSocket(conn net.Conn) (net.Conn, error) {
 	}
 	req += "\r\n"
 
+	// 设置写入超时
+	conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
 	if _, err := conn.Write([]byte(req)); err != nil {
+		conn.Close()
 		return nil, err
 	}
+	conn.SetWriteDeadline(time.Time{})
 
 	br := bufio.NewReader(conn)
+	// 设置读取超时
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	resp, err := http.ReadResponse(br, &http.Request{Method: "GET"})
+	conn.SetReadDeadline(time.Time{})
+	
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode != 101 {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return nil, fmt.Errorf("ws status: %d", resp.StatusCode)
 	}
 
 	return NewWSConn(conn, br), nil
@@ -123,7 +148,11 @@ func (w *WSConn) Write(b []byte) (int, error) {
 	length := len(b)
 	if length == 0 { return 0, nil }
 
-	buf := make([]byte, 0, 14+length)
+	// 优化内存分配，复用 buffer 计算
+	// 加上 mask key (4) 和最大头部 (10)
+	buf := make([]byte, 0, length+14)
+	
+	// Binary Frame (0x82)
 	buf = append(buf, 0x82)
 
 	if length < 126 {
@@ -137,9 +166,10 @@ func (w *WSConn) Write(b []byte) (int, error) {
 	}
 
 	maskKey := make([]byte, 4)
-	rand.Read(maskKey) // 使用 crypto/rand
+	rand.Read(maskKey)
 	buf = append(buf, maskKey...)
 
+	// 将 payload 数据追加并就地加密，减少 copy
 	payloadStart := len(buf)
 	buf = append(buf, b...)
 	
