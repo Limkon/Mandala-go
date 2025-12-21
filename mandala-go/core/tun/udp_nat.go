@@ -68,9 +68,12 @@ func (m *UDPNatManager) GetOrCreate(key string, localConn *gonet.UDPConn, target
 	case "vless":
 		payload, hErr = protocol.BuildVlessPayload(m.config.UUID, targetIP, targetPort)
 		isVless = true
+
+	// [新增] Shadowsocks
 	case "shadowsocks":
-		// [修复] 传入 Password 参数
-		payload, hErr = protocol.BuildShadowsocksPayload(m.config.Password, targetIP, targetPort)
+		payload, hErr = protocol.BuildShadowsocksPayload(targetIP, targetPort)
+
+	// [新增] SOCKS5
 	case "socks", "socks5":
 		hErr = protocol.HandshakeSocks5(remoteConn, m.config.Username, m.config.Password, targetIP, targetPort)
 	}
