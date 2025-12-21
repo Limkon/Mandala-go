@@ -15,7 +15,6 @@ func HandshakeSocks5(conn io.ReadWriter, username, password, targetHost string, 
 	log.Printf("[Socks5] Handshaking for %s:%d", targetHost, targetPort)
 
 	// 1. 发送 Method
-	// 如果有用户名，仅发送 0x02 (User/Pass)，否则发送 0x00 (No Auth)
 	var methods []byte
 	if username != "" {
 		methods = []byte{0x02}
@@ -68,7 +67,7 @@ func HandshakeSocks5(conn io.ReadWriter, username, password, targetHost string, 
 		return fmt.Errorf("unsupported method: 0x%02x", authMethod)
 	}
 
-	// 4. 发送 Connect Request (内联地址构造)
+	// 4. 发送 Connect Request
 	var buf bytes.Buffer
 	buf.Write([]byte{0x05, 0x01, 0x00}) // VER, CMD=CONNECT, RSV
 
@@ -90,7 +89,6 @@ func HandshakeSocks5(conn io.ReadWriter, username, password, targetHost string, 
 		buf.WriteString(targetHost)
 	}
 
-	// Port
 	portBuf := make([]byte, 2)
 	binary.BigEndian.PutUint16(portBuf, uint16(targetPort))
 	buf.Write(portBuf)
@@ -99,10 +97,7 @@ func HandshakeSocks5(conn io.ReadWriter, username, password, targetHost string, 
 		return fmt.Errorf("write connect failed: %v", err)
 	}
 
-	// 5. [关键修复] 读取 Connect Resp (只读前 4 字节)
-	// C 版本 proxy.c 只读了前 4 字节 (VER, REP, RSV, ATYP)。
-	// 如果我们像标准库那样尝试读取后续的 BND.ADDR/PORT，而服务端没发，Go 就会在这里永久卡死。
-	// 这就是"发送多，接收少"（只有握手包）的根本原因。
+	// 5. 读取 Connect Resp 头部 (4字节)
 	connRespHead := make([]byte, 4)
 	if _, err := io.ReadFull(conn, connRespHead); err != nil {
 		return fmt.Errorf("read connect resp failed: %v", err)
@@ -111,7 +106,27 @@ func HandshakeSocks5(conn io.ReadWriter, username, password, targetHost string, 
 	if connRespHead[1] != 0x00 {
 		return fmt.Errorf("connect failed status: 0x%02x", connRespHead[1])
 	}
+
+	// 6. [修正] 完整读取剩余的 BND.ADDR/PORT
+	// 必须消耗掉这些数据，否则它们会残留在流中，导致浏览器解析错误 (这解释了为何数据流会中断)
+	var left int
+	switch connRespHead[3] {
+	case 0x01: left = 4 + 2 // IPv4
+	case 0x04: left = 16 + 2 // IPv6
+	case 0x03: // Domain
+		lenByte := make([]byte, 1)
+		if _, err := io.ReadFull(conn, lenByte); err != nil {
+			return fmt.Errorf("read domain len failed: %v", err)
+		}
+		left = int(lenByte[0]) + 2
+	default:
+		return fmt.Errorf("invalid atyp: 0x%02x", connRespHead[3])
+	}
+
+	discard := make([]byte, left)
+	if _, err := io.ReadFull(conn, discard); err != nil {
+		return fmt.Errorf("read connect body failed: %v", err)
+	}
 	
-	// 握手成功，不读取后续字节，直接返回，交给 Tunnel 处理数据流
 	return nil
 }
