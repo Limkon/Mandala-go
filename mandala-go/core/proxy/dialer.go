@@ -1,222 +1,196 @@
 package proxy
 
 import (
-	"bufio"
-	"crypto/rand"
-	"crypto/tls"
-	"encoding/base64"
-	"encoding/binary"
-	"fmt"
 	"io"
 	"log"
 	"net"
-	"net/http"
+	"strings"
+	"syscall"
 	"time"
 
 	"mandala/core/config"
+	"mandala/core/protocol"
 )
 
-func init() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-}
-
-type Dialer struct {
+// Handler 处理单个本地连接
+type Handler struct {
 	Config *config.OutboundConfig
 }
 
-func NewDialer(cfg *config.OutboundConfig) *Dialer {
-	return &Dialer{Config: cfg}
-}
+// HandleConnection 处理 SOCKS5 请求并转发
+func (h *Handler) HandleConnection(localConn net.Conn) {
+	defer localConn.Close()
 
-func (d *Dialer) Dial() (net.Conn, error) {
-	targetAddr := fmt.Sprintf("%s:%d", d.Config.Server, d.Config.ServerPort)
-	conn, err := net.DialTimeout("tcp", targetAddr, 5*time.Second)
+	// 1. SOCKS5 握手 (无需认证)
+	buf := make([]byte, 262)
+	if _, err := io.ReadFull(localConn, buf[:2]); err != nil {
+		return
+	}
+	if buf[0] != 0x05 {
+		return
+	}
+	localConn.Write([]byte{0x05, 0x00})
+
+	// 2. 读取客户端请求
+	n, err := io.ReadFull(localConn, buf[:4])
+	if err != nil || n < 4 {
+		return
+	}
+	cmd := buf[1]
+	atyp := buf[3]
+	var targetHost string
+	var targetPort int
+	if cmd != 0x01 {
+		return
+	}
+
+	// 解析目标地址
+	switch atyp {
+	case 0x01: // IPv4
+		ipBuf := make([]byte, 4)
+		if _, err := io.ReadFull(localConn, ipBuf); err != nil {
+			return
+		}
+		targetHost = net.IP(ipBuf).String()
+	case 0x03: // Domain
+		lenBuf := make([]byte, 1)
+		if _, err := io.ReadFull(localConn, lenBuf); err != nil {
+			return
+		}
+		domainLen := int(lenBuf[0])
+		domainBuf := make([]byte, domainLen)
+		if _, err := io.ReadFull(localConn, domainBuf); err != nil {
+			return
+		}
+		targetHost = string(domainBuf)
+	case 0x04: // IPv6
+		ipBuf := make([]byte, 16)
+		if _, err := io.ReadFull(localConn, ipBuf); err != nil {
+			return
+		}
+		targetHost = net.IP(ipBuf).String()
+	default:
+		return
+	}
+	portBuf := make([]byte, 2)
+	if _, err := io.ReadFull(localConn, portBuf); err != nil {
+		return
+	}
+	targetPort = int(portBuf[0])<<8 | int(portBuf[1])
+
+	// 3. 连接远程代理服务器
+	dialer := NewDialer(h.Config)
+	remoteConn, err := dialer.Dial()
 	if err != nil {
-		return nil, err
+		log.Printf("[Proxy] Dial remote failed: %v", err)
+		localConn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
 	}
+	defer remoteConn.Close()
 
-	// [优化] 强制开启 NoDelay 和 KeepAlive
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetNoDelay(true) 
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(15 * time.Second)
-	}
-
-	if d.Config.TLS != nil && d.Config.TLS.Enabled {
-		tlsConfig := &tls.Config{
-			ServerName:         d.Config.TLS.ServerName,
-			InsecureSkipVerify: d.Config.TLS.Insecure,
-			MinVersion:         tls.VersionTLS12,
-		}
-		if tlsConfig.ServerName == "" {
-			tlsConfig.ServerName = d.Config.Server
-		}
-		
-		tlsConn := tls.Client(conn, tlsConfig)
-		tlsConn.SetDeadline(time.Now().Add(5 * time.Second))
-		if err := tlsConn.Handshake(); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("tls handshake failed: %v", err)
-		}
-		tlsConn.SetDeadline(time.Time{})
-		conn = tlsConn
-	}
-
-	if d.Config.Transport != nil && d.Config.Transport.Type == "ws" {
-		wsConn, err := d.handshakeWebSocket(conn)
+	// 4. 发送协议头 (握手)
+	proxyType := strings.ToLower(h.Config.Type)
+	isVless := false
+	switch proxyType {
+	case "mandala":
+		client := protocol.NewMandalaClient(h.Config.Username, h.Config.Password)
+		payload, err := client.BuildHandshakePayload(targetHost, targetPort)
 		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("websocket handshake failed: %v", err)
+			log.Printf("[Mandala] Build payload failed: %v", err)
+			return
 		}
-		return wsConn, nil
-	}
-
-	return conn, nil
-}
-
-func (d *Dialer) handshakeWebSocket(conn net.Conn) (net.Conn, error) {
-	path := d.Config.Transport.Path
-	if path == "" { path = "/" }
-	
-	host := d.Config.Server
-	if d.Config.TLS != nil && d.Config.TLS.ServerName != "" {
-		host = d.Config.TLS.ServerName
-	}
-
-	key := make([]byte, 16)
-	rand.Read(key)
-	keyStr := base64.StdEncoding.EncodeToString(key)
-
-	// [重要] 使用 Android User-Agent，防止被 CDN 拦截
-	ua := "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-	
-	// [修复] 将 keyStr 正确传递给 Sprintf
-	req := fmt.Sprintf("GET %s HTTP/1.1\r\n"+
-		"Host: %s\r\n"+
-		"User-Agent: %s\r\n"+
-		"Upgrade: websocket\r\n"+
-		"Connection: Upgrade\r\n"+
-		"Sec-WebSocket-Key: %s\r\n"+
-		"Sec-WebSocket-Version: 13\r\n", path, host, ua, keyStr)
-
-	if d.Config.Transport.Headers != nil {
-		for k, v := range d.Config.Transport.Headers {
-			req += fmt.Sprintf("%s: %s\r\n", k, v)
+		if _, err := remoteConn.Write(payload); err != nil {
+			log.Printf("[Mandala] Handshake write failed: %v", err)
+			return
 		}
-	}
-	req += "\r\n"
-
-	conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
-	if _, err := conn.Write([]byte(req)); err != nil {
-		conn.Close()
-		return nil, err
-	}
-	conn.SetWriteDeadline(time.Time{})
-
-	br := bufio.NewReader(conn)
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	resp, err := http.ReadResponse(br, &http.Request{Method: "GET"})
-	conn.SetReadDeadline(time.Time{})
-	
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != 101 {
-		return nil, fmt.Errorf("ws status: %d", resp.StatusCode)
-	}
-
-	return NewWSConn(conn, br), nil
-}
-
-type WSConn struct {
-	net.Conn
-	reader    *bufio.Reader
-	remaining int64 
-}
-
-func NewWSConn(c net.Conn, br *bufio.Reader) *WSConn {
-	return &WSConn{Conn: c, reader: br, remaining: 0}
-}
-
-func (w *WSConn) Write(b []byte) (int, error) {
-	length := len(b)
-	if length == 0 { return 0, nil }
-
-	buf := make([]byte, 0, length+14)
-	buf = append(buf, 0x82)
-
-	if length < 126 {
-		buf = append(buf, byte(length)|0x80)
-	} else if length <= 65535 {
-		buf = append(buf, 126|0x80)
-		buf = binary.BigEndian.AppendUint16(buf, uint16(length))
-	} else {
-		buf = append(buf, 127|0x80)
-		buf = binary.BigEndian.AppendUint64(buf, uint64(length))
-	}
-
-	maskKey := make([]byte, 4)
-	rand.Read(maskKey)
-	buf = append(buf, maskKey...)
-
-	payloadStart := len(buf)
-	buf = append(buf, b...)
-	
-	for i := 0; i < length; i++ {
-		buf[payloadStart+i] ^= maskKey[i%4]
-	}
-
-	if _, err := w.Conn.Write(buf); err != nil {
-		return 0, err
-	}
-	return length, nil
-}
-
-func (w *WSConn) Read(b []byte) (int, error) {
-	for {
-		if w.remaining > 0 {
-			limit := int64(len(b))
-			if w.remaining < limit { limit = w.remaining }
-			n, err := w.reader.Read(b[:limit])
-			if n > 0 { w.remaining -= int64(n) }
-			if n > 0 || err != nil { return n, err }
+	case "trojan":
+		payload, err := protocol.BuildTrojanPayload(h.Config.Password, targetHost, targetPort)
+		if err != nil {
+			log.Printf("[Trojan] Build payload failed: %v", err)
+			return
 		}
-
-		header, err := w.reader.ReadByte()
-		if err != nil { return 0, err }
-		
-		opcode := header & 0x0F
-		lenByte, err := w.reader.ReadByte()
-		if err != nil { return 0, err }
-
-		masked := (lenByte & 0x80) != 0
-		payloadLen := int64(lenByte & 0x7F)
-
-		if payloadLen == 126 {
-			lenBuf := make([]byte, 2)
-			if _, err := io.ReadFull(w.reader, lenBuf); err != nil { return 0, err }
-			payloadLen = int64(binary.BigEndian.Uint16(lenBuf))
-		} else if payloadLen == 127 {
-			lenBuf := make([]byte, 8)
-			if _, err := io.ReadFull(w.reader, lenBuf); err != nil { return 0, err }
-			payloadLen = int64(binary.BigEndian.Uint64(lenBuf))
+		if _, err := remoteConn.Write(payload); err != nil {
+			log.Printf("[Trojan] Handshake write failed: %v", err)
+			return
 		}
-
-		if masked {
-			if _, err := io.ReadFull(w.reader, make([]byte, 4)); err != nil { return 0, err }
+	case "vless":
+		payload, err := protocol.BuildVlessPayload(h.Config.UUID, targetHost, targetPort)
+		if err != nil {
+			log.Printf("[Vless] Build payload failed: %v", err)
+			return
 		}
+		if _, err := remoteConn.Write(payload); err != nil {
+			log.Printf("[Vless] Handshake write failed: %v", err)
+			return
+		}
+		isVless = true
+	case "shadowsocks":
+		payload, err := protocol.BuildShadowsocksPayload(targetHost, targetPort)
+		if err != nil {
+			log.Printf("[Shadowsocks] Build payload failed: %v", err)
+			return
+		}
+		if _, err := remoteConn.Write(payload); err != nil {
+			log.Printf("[Shadowsocks] Handshake write failed: %v", err)
+			return
+		}
+	case "socks", "socks5":
+		err := protocol.HandshakeSocks5(remoteConn, h.Config.Username, h.Config.Password, targetHost, targetPort)
+		if err != nil {
+			log.Printf("[Socks5] Handshake failed: %v", err)
+			return
+		}
+	default:
+		log.Println("[Proxy] Protocol not implemented:", proxyType)
+		return
+	}
 
-		switch opcode {
-		case 0x8: return 0, io.EOF
-		case 0x9, 0xA:
-			if payloadLen > 0 { io.CopyN(io.Discard, w.reader, payloadLen) }
-			continue
-		case 0x0, 0x1, 0x2:
-			w.remaining = payloadLen
-			if w.remaining == 0 { continue }
-		default:
-			if payloadLen > 0 { io.CopyN(io.Discard, w.reader, payloadLen) }
-			continue
+	// 如果是 VLESS，包装连接以剥离响应头
+	if isVless {
+		remoteConn = protocol.NewVlessConn(remoteConn)
+	}
+
+	// 5. 告知本地客户端连接成功
+	if _, err := localConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+		return
+	}
+
+	// 6. 双向转发（关键修改：防止碎片化）
+	localConn.SetDeadline(time.Time{})
+	remoteConn.SetDeadline(time.Time{})
+
+	// 优化：设置 TCP NoDelay 和 MSS，限制缓冲大小
+	if tcpl, ok := localConn.(*net.TCPConn); ok {
+		tcpl.SetNoDelay(true)
+	}
+	if tcpr, ok := remoteConn.(*net.TCPConn); ok {
+		tcpr.SetNoDelay(true)
+		// 设置 TCP MSS = 1360（对应 MTU 1400），防止碎片
+		if f, err := tcpr.File(); err == nil {
+			_ = syscall.SetsockoptInt(int(f.Fd()), syscall.IPPROTO_TCP, syscall.TCP_MAXSEG, 1360)
 		}
 	}
+
+	// 使用固定小缓冲区
+	buf := make([]byte, 1400)
+
+	errChan := make(chan error, 2)
+	go func() {
+		_, err := io.CopyBuffer(remoteConn, localConn, buf)
+		errChan <- err
+	}()
+	go func() {
+		_, err := io.CopyBuffer(localConn, remoteConn, buf)
+		errChan <- err
+	}()
+
+	// 等待任一方向结束（修复：用 = 赋值，而不是 := 声明）
+	err = <-errChan
+	if err != nil && err != io.EOF {
+		log.Printf("[Proxy] Relay error: %v", err)
+	}
+
+	// 关闭连接
+	localConn.Close()
+	remoteConn.Close()
 }
