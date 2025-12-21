@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync" // [新增] 用于 sync.Once
 	"time"
 
 	"mandala/core/config"
@@ -29,13 +30,14 @@ func init() {
 }
 
 type Stack struct {
-	stack  *stack.Stack
-	device *Device
-	dialer *proxy.Dialer
-	config *config.OutboundConfig
-	nat    *UDPNatManager
-	ctx    context.Context
-	cancel context.CancelFunc
+	stack     *stack.Stack
+	device    *Device
+	dialer    *proxy.Dialer
+	config    *config.OutboundConfig
+	nat       *UDPNatManager
+	ctx       context.Context
+	cancel    context.CancelFunc
+	closeOnce sync.Once // [新增] 确保只关闭一次，防止 Panic
 }
 
 func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
@@ -62,7 +64,8 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 	s.SetForwardingDefaultAndAllNICs(ipv6.ProtocolNumber, true)
 
 	nicID := tcpip.NICID(1)
-	// [修复] 直接使用 device 的 endpoint，移除未使用的 sniffer
+	
+	// [修复] 直接使用 dev.LinkEndpoint()，移除了未使用的 sniffer 包引用
 	if err := s.CreateNIC(nicID, dev.LinkEndpoint()); err != nil {
 		dev.Close()
 		return nil, fmt.Errorf("创建网卡失败: %v", err)
@@ -77,6 +80,7 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	dialer := proxy.NewDialer(cfg)
+	
 	tStack := &Stack{
 		stack:  s,
 		device: dev,
@@ -117,7 +121,7 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	// 1. 拨号代理
 	remoteConn, dialErr := s.dialer.Dial()
 	if dialErr != nil {
-		log.Printf("[TCP] Dial失败: %v", dialErr)
+		// log.Printf("[TCP] Dial失败: %v", dialErr) // 可选日志
 		r.Complete(true)
 		return
 	}
@@ -163,7 +167,7 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	localConn := gonet.NewTCPConn(&wq, ep)
 	defer localConn.Close()
 
-	// 4. 转发
+	// 4. 双向转发
 	go func() {
 		io.Copy(localConn, remoteConn)
 		localConn.CloseWrite()
@@ -176,20 +180,19 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 	id := r.ID()
 	targetPort := int(id.LocalPort)
 
-	// [修复] 拦截 DNS 请求 (端口 53)
+	// [DNS处理] 拦截 53 端口
 	if targetPort == 53 {
 		var wq waiter.Queue
 		ep, err := r.CreateEndpoint(&wq)
 		if err != nil { return }
 		localConn := gonet.NewUDPConn(s.stack, &wq, ep)
-		
-		// 这里的处理函数已改为 RemoteDNS，不再使用 net.Dial
 		go s.handleRemoteDNS(localConn)
 		return
 	}
 
-	// 这里的 net.IP 使用确保了 net 包被引用，避免 "imported and not used"
+	// [关键] 必须使用 net 包，否则编译会报错 "net imported and not used"
 	targetIP := net.IP(id.LocalAddress.AsSlice()).String()
+	
 	srcKey := fmt.Sprintf("%s:%d->%s:%d", id.RemoteAddress.String(), id.RemotePort, targetIP, targetPort)
 
 	var wq waiter.Queue
@@ -205,6 +208,7 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 		return
 	}
 
+	// Local -> Remote 转发
 	go func() {
 		defer localConn.Close()
 		buf := make([]byte, 4096)
@@ -217,7 +221,6 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 	}()
 }
 
-// [修复] 通过代理转发 DNS，而不是直接连接
 func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
@@ -234,7 +237,7 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 	}
 	defer proxyConn.Close()
 
-	// 2. 发送握手 (连接到 8.8.8.8:53)
+	// 2. 发送握手 (固定转发到 Google DNS 8.8.8.8:53)
 	var payload []byte
 	switch strings.ToLower(s.config.Type) {
 	case "mandala":
@@ -248,7 +251,7 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 	
 	if _, err := proxyConn.Write(payload); err != nil { return }
 
-	// 3. 封装 DNS 请求为 TCP (2字节长度 + 数据)
+	// 3. 封装 DNS 请求为 TCP (2字节长度头 + 数据)
 	reqData := make([]byte, 2+n)
 	reqData[0] = byte(n >> 8)
 	reqData[1] = byte(n)
@@ -266,11 +269,33 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 
 	// 5. 写回 Android
 	conn.Write(respBuf)
-	log.Printf("[DNS] 代理解析成功")
+	log.Printf("[DNS] 代理解析完成")
 }
 
+// [修复] 线程安全的 Close 方法，防止重复关闭导致的 Panic
 func (s *Stack) Close() {
-	s.cancel()
-	if s.device != nil { s.device.Close() }
-	if s.stack != nil { s.stack.Close() }
+	s.closeOnce.Do(func() {
+		log.Println("[Stack] Stopping...")
+		
+		// 1. 取消 Context 通知所有子协程退出
+		if s.cancel != nil {
+			s.cancel()
+		}
+		
+		// 2. 稍微等待资源释放
+		time.Sleep(100 * time.Millisecond)
+
+		// 3. 关闭设备文件描述符
+		if s.device != nil {
+			s.device.Close()
+		}
+		
+		// 4. 关闭 gVisor 协议栈
+		if s.stack != nil {
+			s.stack.CloseNIC(1) // 关闭网卡
+			s.stack.Close()     // 关闭栈
+		}
+		
+		log.Println("[Stack] Stopped.")
+	})
 }
