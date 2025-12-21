@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
+	// [修复] 删除未使用的 "net" 包
 	"strings"
 	"sync"
 	"time"
@@ -139,12 +139,8 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	case "vless":
 		payload, hErr = protocol.BuildVlessPayload(s.config.UUID, targetHost, targetPort)
 		isVless = true
-
-	// [新增] Shadowsocks
 	case "shadowsocks":
 		payload, hErr = protocol.BuildShadowsocksPayload(targetHost, targetPort)
-
-	// [新增] SOCKS5 (交互式握手，无 Payload 生成)
 	case "socks", "socks5":
 		hErr = protocol.HandshakeSocks5(remoteConn, s.config.Username, s.config.Password, targetHost, targetPort)
 	}
@@ -154,7 +150,6 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 		return
 	}
 
-	// 发送握手包 (适用于 Mandala, Trojan, Vless, Shadowsocks)
 	if len(payload) > 0 {
 		if _, err := remoteConn.Write(payload); err != nil {
 			r.Complete(true)
@@ -162,7 +157,6 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 		}
 	}
 
-	// 如果是 VLESS，应用响应头剥离器
 	if isVless {
 		remoteConn = protocol.NewVlessConn(remoteConn)
 	}
@@ -200,7 +194,6 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 		var wq waiter.Queue
 		ep, err := r.CreateEndpoint(&wq)
 		if err != nil {
-			// 如果创建端点失败，无法处理，只能忽略
 			return
 		}
 		localConn := gonet.NewUDPConn(s.stack, &wq, ep)
@@ -208,10 +201,10 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 		return
 	}
 
-	// [修复] 对于非 53 端口的 UDP 流量 (例如 QUIC 443)，直接丢弃。
-	// r.Complete(true) 告诉 gVisor 我们已经“处理”了这个请求（实际上是决定不转发），
-	// 从而释放相关资源。客户端（浏览器）会因收不到响应而超时，随后切换到 TCP。
-	r.Complete(true)
+	// [UDP 丢弃]
+	// 对于非 53 端口 UDP (如 QUIC)，直接返回。
+	// gVisor UDP ForwarderRequest 没有 Complete 方法，不调用 CreateEndpoint 即视为丢弃/不处理。
+	return
 }
 
 func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
@@ -245,12 +238,8 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 	case "vless":
 		payload, _ = protocol.BuildVlessPayload(s.config.UUID, "8.8.8.8", 53)
 		isVless = true
-
-	// [新增] Shadowsocks
 	case "shadowsocks":
 		payload, _ = protocol.BuildShadowsocksPayload("8.8.8.8", 53)
-
-	// [新增] SOCKS5
 	case "socks", "socks5":
 		if err := protocol.HandshakeSocks5(proxyConn, s.config.Username, s.config.Password, "8.8.8.8", 53); err != nil {
 			log.Printf("[DNS] Socks5握手失败: %v", err)
