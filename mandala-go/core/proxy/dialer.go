@@ -16,7 +16,6 @@ import (
 )
 
 func init() {
-	// [修复] 初始化随机数种子
 	rand.Seed(time.Now().UnixNano())
 }
 
@@ -35,7 +34,7 @@ func (d *Dialer) Dial() (net.Conn, error) {
 		return nil, err
 	}
 
-	// [修复] 启用 TCP KeepAlive，防止连接在无数据时被运营商或防火墙切断
+	// [修复] 启用 TCP KeepAlive，防止移动网络下连接假死
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(15 * time.Second)
@@ -75,7 +74,6 @@ func (d *Dialer) handshakeWebSocket(conn net.Conn) (net.Conn, error) {
 	path := d.Config.Transport.Path
 	if path == "" { path = "/" }
 	
-	// [修复] 安全获取 Host，防止 TLS 配置为空时崩溃
 	host := d.Config.Server
 	if d.Config.TLS != nil && d.Config.TLS.ServerName != "" {
 		host = d.Config.TLS.ServerName
@@ -85,9 +83,8 @@ func (d *Dialer) handshakeWebSocket(conn net.Conn) (net.Conn, error) {
 	rand.Read(key)
 	keyStr := base64.StdEncoding.EncodeToString(key)
 
-	// [修复] 添加 User-Agent 头
-	// 许多服务器和 CDN (如 Cloudflare) 会拒绝没有 UA 的 WebSocket 请求。
-	// 这里硬编码一个常见的 Chrome UA，与 C 版本行为保持一致。
+	// [关键修复] 添加 User-Agent。
+	// 很多 CDN 和服务端（如 C 版本 proxy.c）会检查或记录 UA，缺失可能导致连接被阻断。
 	req := fmt.Sprintf("GET %s HTTP/1.1\r\n"+
 		"Host: %s\r\n"+
 		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"+
@@ -108,7 +105,6 @@ func (d *Dialer) handshakeWebSocket(conn net.Conn) (net.Conn, error) {
 	}
 
 	br := bufio.NewReader(conn)
-	// 使用 http.ReadResponse 读取响应，它会自动处理 Header 结束符
 	resp, err := http.ReadResponse(br, &http.Request{Method: "GET"})
 	if err != nil {
 		return nil, err
@@ -134,7 +130,6 @@ func (w *WSConn) Write(b []byte) (int, error) {
 	length := len(b)
 	if length == 0 { return 0, nil }
 
-	// 预分配 buffer，避免多次 append 导致内存拷贝
 	buf := make([]byte, 0, 14+length)
 	buf = append(buf, 0x82) // Binary Frame
 
@@ -155,7 +150,6 @@ func (w *WSConn) Write(b []byte) (int, error) {
 	payloadStart := len(buf)
 	buf = append(buf, b...)
 	
-	// XOR Masking
 	for i := 0; i < length; i++ {
 		buf[payloadStart+i] ^= maskKey[i%4]
 	}
@@ -168,7 +162,6 @@ func (w *WSConn) Write(b []byte) (int, error) {
 
 func (w *WSConn) Read(b []byte) (int, error) {
 	for {
-		// 1. 如果当前帧还有剩余数据未读，直接读取 payload
 		if w.remaining > 0 {
 			limit := int64(len(b))
 			if w.remaining < limit { limit = w.remaining }
@@ -177,7 +170,6 @@ func (w *WSConn) Read(b []byte) (int, error) {
 			if n > 0 || err != nil { return n, err }
 		}
 
-		// 2. 读取新帧头部
 		header, err := w.reader.ReadByte()
 		if err != nil { return 0, err }
 		
@@ -198,34 +190,21 @@ func (w *WSConn) Read(b []byte) (int, error) {
 			payloadLen = int64(binary.BigEndian.Uint64(lenBuf))
 		}
 
-		// 忽略 Mask (服务端发回的数据通常不 Mask，但也可能有，忽略 Mask Key 即可)
 		if masked {
-			if _, err := io.Discard.Write(make([]byte, 4)); err != nil { 
-				// io.Discard Write always returns nil error, but reading from reader might fail
-				// Better way to skip 4 bytes:
-				maskBuf := make([]byte, 4)
-				if _, err := io.ReadFull(w.reader, maskBuf); err != nil { return 0, err }
-			}
+			// 如果服务端发来 Mask 数据，跳过 Key 并继续（虽然不符合 RFC，但作为客户端兼容处理）
+			if _, err := io.ReadFull(w.reader, make([]byte, 4)); err != nil { return 0, err }
 		}
 
-		// 处理控制帧
 		switch opcode {
-		case 0x8: // Close Frame
-			return 0, io.EOF
-		case 0x9, 0xA: // Ping / Pong
-			if payloadLen > 0 {
-				io.CopyN(io.Discard, w.reader, payloadLen)
-			}
+		case 0x8: return 0, io.EOF
+		case 0x9, 0xA:
+			if payloadLen > 0 { io.CopyN(io.Discard, w.reader, payloadLen) }
 			continue
-		case 0x0, 0x1, 0x2: // Continuation, Text, Binary
+		case 0x0, 0x1, 0x2:
 			w.remaining = payloadLen
 			if w.remaining == 0 { continue }
-			// 循环回到步骤 1 读取数据
 		default:
-			// 未知帧，丢弃
-			if payloadLen > 0 {
-				io.CopyN(io.Discard, w.reader, payloadLen)
-			}
+			if payloadLen > 0 { io.CopyN(io.Discard, w.reader, payloadLen) }
 			continue
 		}
 	}
