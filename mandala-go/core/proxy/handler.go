@@ -130,9 +130,10 @@ func (h *Handler) HandleConnection(localConn net.Conn) {
 		}
 		isVless = true
 
-	// [新增] Shadowsocks 支持
+	// Shadowsocks 支持
 	case "shadowsocks":
-		payload, err := protocol.BuildShadowsocksPayload(targetHost, targetPort)
+		// [修复] 传入 Password 参数以匹配 protocol.BuildShadowsocksPayload 的新定义
+		payload, err := protocol.BuildShadowsocksPayload(h.Config.Password, targetHost, targetPort)
 		if err != nil {
 			log.Printf("[Shadowsocks] Build payload failed: %v", err)
 			return
@@ -142,7 +143,7 @@ func (h *Handler) HandleConnection(localConn net.Conn) {
 			return
 		}
 
-	// [新增] SOCKS5 支持 (含认证)
+	// SOCKS5 支持 (含认证)
 	case "socks", "socks5":
 		err := protocol.HandshakeSocks5(remoteConn, h.Config.Username, h.Config.Password, targetHost, targetPort)
 		if err != nil {
