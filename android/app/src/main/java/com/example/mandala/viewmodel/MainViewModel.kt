@@ -11,7 +11,6 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import mobile.Mobile
 
-// [修改] 多语言字符串封装，增加编辑/删除相关字段
 data class AppStrings(
     val home: String,
     val profiles: String,
@@ -41,7 +40,6 @@ data class AppStrings(
     val about: String,
     val confirm: String,
     val cancel: String,
-    // 新增字段
     val edit: String,
     val delete: String,
     val save: String,
@@ -69,7 +67,6 @@ val ChineseStrings = AppStrings(
     localPort = "本地监听端口",
     appSettings = "应用设置", theme = "主题", language = "语言",
     about = "关于", confirm = "确定", cancel = "取消",
-    // 新增
     edit = "编辑", delete = "删除", save = "保存",
     deleteConfirm = "确定要删除此节点吗？",
     tag = "备注", address = "地址", port = "端口",
@@ -91,7 +88,6 @@ val EnglishStrings = AppStrings(
     localPort = "Local Port",
     appSettings = "App Settings", theme = "Theme", language = "Language",
     about = "About", confirm = "OK", cancel = "Cancel",
-    // 新增
     edit = "Edit", delete = "Delete", save = "Save",
     deleteConfirm = "Are you sure you want to delete this node?",
     tag = "Tag", address = "Address", port = "Port",
@@ -111,9 +107,7 @@ data class Node(
     val isSelected: Boolean = false
 )
 
-// 主题枚举
 enum class AppThemeMode { SYSTEM, LIGHT, DARK }
-// 语言枚举
 enum class AppLanguage { CHINESE, ENGLISH }
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -132,7 +126,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _currentNode = MutableStateFlow(Node("未选择", "none", "0.0.0.0", 0))
     val currentNode = _currentNode.asStateFlow()
 
-    // 设置状态
     private val _vpnMode = MutableStateFlow(prefs.getBoolean("vpn_mode", true))
     val vpnMode = _vpnMode.asStateFlow()
 
@@ -174,7 +167,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _isConnected.value = Mobile.isRunning()
     }
 
-    // 更新 Boolean 设置
     fun updateSetting(key: String, value: Boolean) {
         prefs.edit().putBoolean(key, value).apply()
         when (key) {
@@ -185,7 +177,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // 更新端口设置
     fun updateLocalPort(port: String) {
         val p = port.toIntOrNull()
         if (p != null && p in 1024..65535) {
@@ -194,13 +185,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // 更新主题
     fun updateTheme(mode: AppThemeMode) {
         prefs.edit().putInt("theme_mode", mode.ordinal).apply()
         _themeMode.value = mode
     }
 
-    // 更新语言
     fun updateLanguage(lang: AppLanguage) {
         prefs.edit().putInt("app_language", lang.ordinal).apply()
         _language.value = lang
@@ -210,7 +199,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val saved = repository.loadNodes()
             _nodes.value = saved
-            // 如果列表不为空且当前未选择节点，默认选择第一个
             if (saved.isNotEmpty() && _currentNode.value.protocol == "none") {
                 _currentNode.value = saved[0]
             }
@@ -239,22 +227,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         addLog("[系统] 已选择: ${node.tag}")
     }
 
-    // [新增] 删除节点
     fun deleteNode(node: Node) {
         viewModelScope.launch {
             val currentList = _nodes.value.toMutableList()
-            // 简单对象比较，如果有唯一 ID 更好，但这里用数据类相等性即可
             currentList.remove(node)
             repository.saveNodes(currentList)
             
-            // 如果删除的是当前选中的节点，重置选中状态
             if (_currentNode.value == node) {
                  if (currentList.isNotEmpty()) {
                      _currentNode.value = currentList[0]
                  } else {
                      _currentNode.value = Node("未选择", "none", "0.0.0.0", 0)
                  }
-                 // 如果正在连接，可能需要断开，这里暂不强制断开，仅更新 UI 状态
             }
             
             _nodes.value = currentList
@@ -262,7 +246,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // [新增] 更新节点
     fun updateNode(oldNode: Node, newNode: Node) {
         viewModelScope.launch {
             val currentList = _nodes.value.toMutableList()
@@ -271,10 +254,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 currentList[index] = newNode
                 repository.saveNodes(currentList)
                 
-                // 如果更新的是当前选中的节点，需要同步更新选中状态
                 if (_currentNode.value == oldNode) {
                     _currentNode.value = newNode
-                    // 如果正在运行，配置不会实时生效，需要重连
                 }
                 
                 _nodes.value = currentList
@@ -293,23 +274,42 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         addLog("[核心] 连接已关闭")
     }
 
+    // [修改] 修复后的多节点导入逻辑
     fun importFromText(text: String, onResult: (Boolean, String) -> Unit) {
-        val node = NodeParser.parse(text)
-        if (node != null) {
+        // 使用 parseList 处理多行/多链接文本
+        val newNodes = NodeParser.parseList(text)
+        
+        if (newNodes.isNotEmpty()) {
             viewModelScope.launch {
                 val current = _nodes.value.toMutableList()
-                if (current.any { it.server == node.server && it.port == node.port }) {
-                    onResult(false, "节点已存在")
-                    return@launch
+                var addedCount = 0
+                
+                for (node in newNodes) {
+                    // 简单的重复检测 (基于服务器地址、端口和协议)
+                    val exists = current.any { 
+                        it.server == node.server && 
+                        it.port == node.port && 
+                        it.protocol == node.protocol 
+                    }
+                    
+                    if (!exists) {
+                        current.add(node)
+                        addedCount++
+                    }
                 }
-                current.add(node)
-                repository.saveNodes(current)
-                refreshNodes()
-                addLog("[系统] 导入成功: ${node.tag}")
-                onResult(true, "导入成功")
+
+                if (addedCount > 0) {
+                    repository.saveNodes(current)
+                    refreshNodes()
+                    val msg = "成功导入 $addedCount 个节点" + if (newNodes.size > addedCount) " (过滤 ${newNodes.size - addedCount} 个重复)" else ""
+                    addLog("[系统] $msg")
+                    onResult(true, msg)
+                } else {
+                    onResult(false, "节点已存在，未导入新节点")
+                }
             }
         } else {
-            onResult(false, "无效的链接格式")
+            onResult(false, "未识别到有效的节点链接")
         }
     }
 
