@@ -188,15 +188,19 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	io.Copy(remoteConn, localConn)
 }
 
+// handleUDP 处理 UDP 流量
+// [修复说明] 仅处理 DNS (53端口)，丢弃其他所有 UDP 流量 (如 QUIC)。
+// 这迫使浏览器回退到 TCP 模式，解决网页无法打开的问题。
 func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 	id := r.ID()
 	targetPort := int(id.LocalPort)
 
-	// [DNS处理] 拦截 53 端口
+	// [DNS处理] 拦截 53 端口，进行远程解析
 	if targetPort == 53 {
 		var wq waiter.Queue
 		ep, err := r.CreateEndpoint(&wq)
 		if err != nil {
+			// 如果创建端点失败，无法处理，只能忽略
 			return
 		}
 		localConn := gonet.NewUDPConn(s.stack, &wq, ep)
@@ -204,39 +208,10 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 		return
 	}
 
-	targetIP := net.IP(id.LocalAddress.AsSlice()).String()
-	srcKey := fmt.Sprintf("%s:%d->%s:%d", id.RemoteAddress.String(), id.RemotePort, targetIP, targetPort)
-
-	var wq waiter.Queue
-	ep, err := r.CreateEndpoint(&wq)
-	if err != nil {
-		return
-	}
-
-	localConn := gonet.NewUDPConn(s.stack, &wq, ep)
-
-	// UDP NAT 逻辑
-	session, natErr := s.nat.GetOrCreate(srcKey, localConn, targetIP, targetPort)
-	if natErr != nil {
-		localConn.Close()
-		return
-	}
-
-	// Local -> Remote 转发
-	go func() {
-		defer localConn.Close()
-		buf := make([]byte, 4096)
-		for {
-			localConn.SetDeadline(time.Now().Add(60 * time.Second))
-			n, rErr := localConn.Read(buf)
-			if rErr != nil {
-				return
-			}
-			if _, wErr := session.RemoteConn.Write(buf[:n]); wErr != nil {
-				return
-			}
-		}
-	}()
+	// [修复] 对于非 53 端口的 UDP 流量 (例如 QUIC 443)，直接丢弃。
+	// r.Complete(true) 告诉 gVisor 我们已经“处理”了这个请求（实际上是决定不转发），
+	// 从而释放相关资源。客户端（浏览器）会因收不到响应而超时，随后切换到 TCP。
+	r.Complete(true)
 }
 
 func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
