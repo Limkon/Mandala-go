@@ -33,11 +33,9 @@ fun ProfilesScreen(viewModel: MainViewModel) {
     val strings by viewModel.appStrings.collectAsState()
     val context = LocalContext.current
 
-    // [新增] 弹窗状态管理
     var nodeToEdit by remember { mutableStateOf<Node?>(null) }
     var nodeToDelete by remember { mutableStateOf<Node?>(null) }
 
-    // [新增] 编辑弹窗逻辑
     if (nodeToEdit != null) {
         EditNodeDialog(
             node = nodeToEdit!!,
@@ -50,7 +48,6 @@ fun ProfilesScreen(viewModel: MainViewModel) {
         )
     }
 
-    // [新增] 删除确认弹窗逻辑
     if (nodeToDelete != null) {
         AlertDialog(
             onDismissRequest = { nodeToDelete = null },
@@ -103,7 +100,8 @@ fun ProfilesScreen(viewModel: MainViewModel) {
                 items(nodes) { node ->
                     NodeItem(
                         node = node,
-                        isSelected = node.server == currentNode.server && node.port == currentNode.port,
+                        // [关键修复] 使用严格等于比较，避免 Server/Port 相同的不同节点同时被选中
+                        isSelected = node == currentNode,
                         strings = strings,
                         onSelect = { viewModel.selectNode(node) },
                         onEdit = { nodeToEdit = node },
@@ -115,7 +113,6 @@ fun ProfilesScreen(viewModel: MainViewModel) {
     }
 }
 
-// [修改] NodeItem 增加操作菜单
 @Composable
 fun NodeItem(
     node: Node, 
@@ -142,7 +139,6 @@ fun NodeItem(
                 .fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // 左侧信息
             Column(modifier = Modifier.weight(1f)) {
                 Text(text = node.tag, style = MaterialTheme.typography.titleMedium)
                 Text(
@@ -151,7 +147,6 @@ fun NodeItem(
                 )
             }
             
-            // 右侧图标与菜单
             if (isSelected) {
                 Icon(
                     Icons.Default.Check,
@@ -161,7 +156,6 @@ fun NodeItem(
                 )
             }
 
-            // [新增] 更多操作按钮
             Box {
                 IconButton(onClick = { showMenu = true }) {
                     Icon(Icons.Default.MoreVert, contentDescription = "More")
@@ -190,7 +184,6 @@ fun NodeItem(
     }
 }
 
-// [新增] 编辑节点弹窗组件
 @Composable
 fun EditNodeDialog(
     node: Node,
@@ -198,7 +191,6 @@ fun EditNodeDialog(
     onDismiss: () -> Unit,
     onSave: (Node) -> Unit
 ) {
-    // 临时状态用于表单编辑
     var tag by remember { mutableStateOf(node.tag) }
     var server by remember { mutableStateOf(node.server) }
     var port by remember { mutableStateOf(node.port.toString()) }
@@ -235,7 +227,6 @@ fun EditNodeDialog(
                     modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
                 )
                 
-                // 根据协议类型显示不同的鉴权字段
                 if (node.protocol == "vless" || node.protocol == "vmess") {
                     OutlinedTextField(
                         value = uuid, onValueChange = { uuid = it },
