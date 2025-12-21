@@ -36,6 +36,9 @@ object NodeParser {
                 trimmed.startsWith("vmess://", ignoreCase = true) -> parseVmess(trimmed)
                 trimmed.startsWith("vless://", ignoreCase = true) -> parseVless(trimmed)
                 trimmed.startsWith("trojan://", ignoreCase = true) -> parseTrojan(trimmed)
+                // [新增] 支持 Shadowsocks 和 Socks5
+                trimmed.startsWith("ss://", ignoreCase = true) -> parseShadowsocks(trimmed)
+                trimmed.startsWith("socks5://", ignoreCase = true) -> parseSocks5(trimmed)
                 else -> null
             }
         } catch (e: Exception) {
@@ -122,6 +125,108 @@ object NodeParser {
             transport = if (uri.getQueryParameter("type") == "ws") "ws" else "tcp",
             path = uri.getQueryParameter("path") ?: "/",
             sni = uri.getQueryParameter("sni") ?: ""
+        )
+    }
+
+    // [新增] 解析 Shadowsocks 链接
+    // 支持 ss://method:password@host:port 和 ss://BASE64(method:password)@host:port
+    private fun parseShadowsocks(link: String): Node? {
+        var cleanLink = link
+        var tag = "未命名SS"
+
+        // 提取 Tag (#后面的内容)
+        if (link.contains("#")) {
+            tag = Uri.decode(link.substringAfterLast("#"))
+            cleanLink = link.substringBeforeLast("#")
+        }
+
+        // 尝试解析 URI
+        var uri = Uri.parse(cleanLink)
+        var host = uri.host
+        var port = uri.port
+        var userInfo = uri.userInfo ?: ""
+
+        // 如果 host 为空，可能是 ss://BASE64_ALL 格式
+        if (host.isNullOrEmpty()) {
+            val base64 = cleanLink.removePrefix("ss://")
+            try {
+                // 尝试 Base64 解码整个内容
+                val decoded = String(Base64.decode(base64, Base64.URL_SAFE or Base64.NO_WRAP), StandardCharsets.UTF_8)
+                // 解码后应该是 method:pass@host:port，重新解析
+                uri = Uri.parse("ss://$decoded")
+                host = uri.host
+                port = uri.port
+                userInfo = uri.userInfo ?: ""
+            } catch (e: Exception) {
+                return null
+            }
+        }
+
+        if (host.isNullOrEmpty()) return null
+
+        // 处理用户信息 (method:password)
+        // SIP002 格式可能是 Base64 编码的 user info
+        var method = ""
+        var password = ""
+
+        if (userInfo.isNotEmpty()) {
+            // 如果不包含冒号，可能是 Base64 编码的 method:password
+            if (!userInfo.contains(":")) {
+                try {
+                    val decodedInfo = String(Base64.decode(userInfo, Base64.URL_SAFE or Base64.NO_WRAP), StandardCharsets.UTF_8)
+                    userInfo = decodedInfo
+                } catch (e: Exception) {
+                    // 解码失败则按原样处理
+                }
+            }
+
+            if (userInfo.contains(":")) {
+                method = userInfo.substringBefore(":")
+                password = userInfo.substringAfter(":")
+            } else {
+                password = userInfo
+            }
+        }
+
+        return Node(
+            tag = tag,
+            protocol = "shadowsocks",
+            server = host!!,
+            port = if (port > 0) port else 8388,
+            password = Uri.decode(password),
+            uuid = Uri.decode(method), // 将加密方式 (Method) 存入 uuid 字段
+            transport = "tcp",
+            sni = uri.getQueryParameter("sni") ?: ""
+        )
+    }
+
+    // [新增] 解析 Socks5 链接
+    // 格式: socks5://user:pass@host:port
+    private fun parseSocks5(link: String): Node? {
+        val uri = Uri.parse(link)
+        val host = uri.host ?: return null
+        val userInfo = uri.userInfo ?: ""
+        
+        var username = ""
+        var password = ""
+
+        if (userInfo.isNotEmpty()) {
+            if (userInfo.contains(":")) {
+                username = userInfo.substringBefore(":")
+                password = userInfo.substringAfter(":")
+            } else {
+                username = userInfo
+            }
+        }
+
+        return Node(
+            tag = uri.fragment?.let { Uri.decode(it) } ?: "未命名Socks5",
+            protocol = "socks5",
+            server = host,
+            port = if (uri.port > 0) uri.port else 1080,
+            password = Uri.decode(password), // 密码
+            uuid = Uri.decode(username),     // 将用户名存入 uuid 字段
+            transport = "tcp"
         )
     }
 }
