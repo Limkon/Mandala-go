@@ -7,7 +7,7 @@ import (
 	"log"
 	"net"
 	"strings"
-	"sync" // [必须] 用于 sync.Once
+	"sync"
 	"time"
 
 	"mandala/core/config"
@@ -64,23 +64,26 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 	s.SetForwardingDefaultAndAllNICs(ipv6.ProtocolNumber, true)
 
 	nicID := tcpip.NICID(1)
-	
-	// [修复] 直接使用 dev.LinkEndpoint()，避免未使用的包引用错误
+
+	// [修复] 直接使用 dev.LinkEndpoint()
 	if err := s.CreateNIC(nicID, dev.LinkEndpoint()); err != nil {
 		dev.Close()
 		return nil, fmt.Errorf("创建网卡失败: %v", err)
 	}
+
+	// [关键修复] 开启 IP 欺骗 (Spoofing)
+	// Android VPN 接口收到的包源 IP 是公网 IP，必须允许 Spoofing，否则 gVisor 会丢弃这些包导致 RX=0
+	s.SetPromiscuousMode(nicID, true)
+	s.SetSpoofing(nicID, true)
 
 	s.SetRouteTable([]tcpip.Route{
 		{Destination: header.IPv4EmptySubnet, NIC: nicID},
 		{Destination: header.IPv6EmptySubnet, NIC: nicID},
 	})
 
-	s.SetPromiscuousMode(nicID, true)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	dialer := proxy.NewDialer(cfg)
-	
+
 	tStack := &Stack{
 		stack:  s,
 		device: dev,
@@ -117,7 +120,7 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	}()
 
 	id := r.ID()
-	
+
 	// 1. 拨号代理
 	remoteConn, dialErr := s.dialer.Dial()
 	if dialErr != nil {
@@ -183,7 +186,9 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 	if targetPort == 53 {
 		var wq waiter.Queue
 		ep, err := r.CreateEndpoint(&wq)
-		if err != nil { return }
+		if err != nil {
+			return
+		}
 		localConn := gonet.NewUDPConn(s.stack, &wq, ep)
 		go s.handleRemoteDNS(localConn)
 		return
@@ -195,10 +200,12 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 
 	var wq waiter.Queue
 	ep, err := r.CreateEndpoint(&wq)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 
 	localConn := gonet.NewUDPConn(s.stack, &wq, ep)
-	
+
 	// UDP NAT 逻辑
 	session, natErr := s.nat.GetOrCreate(srcKey, localConn, targetIP, targetPort)
 	if natErr != nil {
@@ -213,8 +220,12 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 		for {
 			localConn.SetDeadline(time.Now().Add(60 * time.Second))
 			n, rErr := localConn.Read(buf)
-			if rErr != nil { return }
-			if _, wErr := session.RemoteConn.Write(buf[:n]); wErr != nil { return }
+			if rErr != nil {
+				return
+			}
+			if _, wErr := session.RemoteConn.Write(buf[:n]); wErr != nil {
+				return
+			}
 		}
 	}()
 }
@@ -222,10 +233,12 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
-	
+
 	buf := make([]byte, 1500)
 	n, err := conn.Read(buf)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 
 	// 1. 连接代理
 	proxyConn, err := s.dialer.Dial()
@@ -246,8 +259,10 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 	case "vless":
 		payload, _ = protocol.BuildVlessPayload(s.config.UUID, "8.8.8.8", 53)
 	}
-	
-	if _, err := proxyConn.Write(payload); err != nil { return }
+
+	if _, err := proxyConn.Write(payload); err != nil {
+		return
+	}
 
 	// 3. 封装 DNS (2字节长度 + 数据)
 	reqData := make([]byte, 2+n)
@@ -255,15 +270,21 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 	reqData[1] = byte(n)
 	copy(reqData[2:], buf[:n])
 
-	if _, err := proxyConn.Write(reqData); err != nil { return }
+	if _, err := proxyConn.Write(reqData); err != nil {
+		return
+	}
 
 	// 4. 读取响应
 	lenBuf := make([]byte, 2)
-	if _, err := io.ReadFull(proxyConn, lenBuf); err != nil { return }
+	if _, err := io.ReadFull(proxyConn, lenBuf); err != nil {
+		return
+	}
 	respLen := int(lenBuf[0])<<8 | int(lenBuf[1])
 
 	respBuf := make([]byte, respLen)
-	if _, err := io.ReadFull(proxyConn, respBuf); err != nil { return }
+	if _, err := io.ReadFull(proxyConn, respBuf); err != nil {
+		return
+	}
 
 	// 5. 写回 Android
 	conn.Write(respBuf)
@@ -274,12 +295,12 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 func (s *Stack) Close() {
 	s.closeOnce.Do(func() {
 		log.Println("[Stack] Stopping...")
-		
+
 		// 1. 取消 Context
 		if s.cancel != nil {
 			s.cancel()
 		}
-		
+
 		// 2. 等待资源释放
 		time.Sleep(100 * time.Millisecond)
 
@@ -287,13 +308,13 @@ func (s *Stack) Close() {
 		if s.device != nil {
 			s.device.Close()
 		}
-		
+
 		// 4. 关闭协议栈
 		if s.stack != nil {
 			// s.stack.CloseNIC(1) // [删除] 此行导致编译错误
-			s.stack.Close()     // 保留此行
+			s.stack.Close() // 保留此行
 		}
-		
+
 		log.Println("[Stack] Stopped.")
 	})
 }
