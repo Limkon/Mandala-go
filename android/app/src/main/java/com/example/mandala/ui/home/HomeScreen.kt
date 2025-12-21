@@ -1,5 +1,3 @@
-// 文件路径: android/app/src/main/java/com/example/mandala/ui/home/HomeScreen.kt
-
 package com.example.mandala.ui.home
 
 import androidx.compose.animation.core.*
@@ -28,8 +26,9 @@ fun HomeScreen(viewModel: MainViewModel) {
     val isConnected by viewModel.isConnected.collectAsState()
     val currentNode by viewModel.currentNode.collectAsState()
     val logs by viewModel.logs.collectAsState()
+    // [新增] 获取多语言字符串
+    val strings by viewModel.appStrings.collectAsState()
 
-    // 连接时的旋转动画
     val infiniteTransition = rememberInfiniteTransition(label = "spin_transition")
     val angle by infiniteTransition.animateFloat(
         initialValue = 0f,
@@ -52,13 +51,13 @@ fun HomeScreen(viewModel: MainViewModel) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                "Mandala", // APP 名称通常保持原样或改为中文名
+                "Mandala",
                 fontSize = 28.sp, 
                 fontWeight = FontWeight.Bold, 
                 color = MaterialTheme.colorScheme.primary
             )
-            IconButton(onClick = { /* TODO: 实现扫码 */ }) {
-                Icon(Icons.Default.QrCodeScanner, contentDescription = "扫码")
+            IconButton(onClick = { /* TODO: 扫码 */ }) {
+                Icon(Icons.Default.QrCodeScanner, contentDescription = "Scan")
             }
         }
 
@@ -71,7 +70,8 @@ fun HomeScreen(viewModel: MainViewModel) {
             shape = RoundedCornerShape(16.dp)
         ) {
             Column(modifier = Modifier.padding(20.dp)) {
-                Text("当前节点", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                // 使用 strings.home 或其他合适标签，这里暂用 currentNode 的上一级标题
+                Text("Current Node", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
                     currentNode.tag, 
@@ -84,7 +84,7 @@ fun HomeScreen(viewModel: MainViewModel) {
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        if (isConnected) "已连接" else "未连接",
+                        if (isConnected) strings.connected else strings.notConnected,
                         color = if (isConnected) Color(0xFF4CAF50) else Color.Gray,
                         fontWeight = FontWeight.Bold
                     )
@@ -97,7 +97,6 @@ fun HomeScreen(viewModel: MainViewModel) {
 
         // --- 连接按钮 ---
         Box(contentAlignment = Alignment.Center) {
-            // 动态光环
             if (isConnected) {
                 Box(
                     modifier = Modifier
@@ -112,7 +111,6 @@ fun HomeScreen(viewModel: MainViewModel) {
                 )
             }
 
-            // 主按钮
             Button(
                 onClick = { viewModel.toggleConnection() },
                 modifier = Modifier.size(140.dp),
@@ -124,7 +122,7 @@ fun HomeScreen(viewModel: MainViewModel) {
             ) {
                 Icon(
                     Icons.Default.PowerSettingsNew,
-                    contentDescription = if (isConnected) "断开" else "连接",
+                    contentDescription = if (isConnected) strings.disconnect else strings.connect,
                     modifier = Modifier.size(64.dp).scale(1.2f)
                 )
             }
@@ -142,9 +140,8 @@ fun HomeScreen(viewModel: MainViewModel) {
             border = androidx.compose.foundation.BorderStroke(1.dp, Color.Gray.copy(alpha = 0.2f))
         ) {
             Column(modifier = Modifier.padding(12.dp)) {
-                Text("系统日志", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                Text("System Logs", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
                 Spacer(modifier = Modifier.height(8.dp))
-                // 显示最后几行日志
                 logs.takeLast(4).forEach { log ->
                     Text(
                         log, 
