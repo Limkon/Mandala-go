@@ -94,8 +94,8 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 }
 
 func (s *Stack) startPacketHandling() {
-	// [修复] 将接收窗口设为 0 (默认)，让 gVisor 自动调整，避免手动设置太小或太大导致问题
-	rcvWnd := 0 
+	// [修复] rcvWnd 设为 0，让 gVisor 自动管理窗口大小
+	rcvWnd := 0
 	maxInFlight := 2048
 
 	tcpHandler := tcp.NewForwarder(s.stack, rcvWnd, maxInFlight, func(r *tcp.ForwarderRequest) {
@@ -173,23 +173,26 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	localConn := gonet.NewTCPConn(&wq, ep)
 	defer localConn.Close()
 
+	// [保持修复] 使用 WaitGroup 确保数据流完整
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	// 下载流: Remote -> App
+	// Remote -> Local
 	go func() {
 		defer wg.Done()
 		io.Copy(localConn, remoteConn)
 		localConn.CloseWrite()
 	}()
 
-	// 上传流: App -> Remote
+	// Local -> Remote
 	io.Copy(remoteConn, localConn)
 
+	// 尝试通知远程服务器关闭写入（如果支持）
 	if cw, ok := remoteConn.(interface{ CloseWrite() error }); ok {
 		cw.CloseWrite()
 	}
 
+	// 等待下载完成
 	wg.Wait()
 }
 
