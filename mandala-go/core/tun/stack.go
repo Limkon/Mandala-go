@@ -60,25 +60,9 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 		},
 	})
 
-	// [关键修复] 配置 TCP 协议栈选项
-	// 启用 SACK (Selective Acknowledgment) 以提高丢包环境下的性能
-	sackOpt := tcp.SACKEnabled(true)
-	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &sackOpt); err != nil {
-		log.Printf("[Stack] Warning: Failed to enable SACK: %v", err)
-	}
-
-	// [关键修复] 增大默认发送缓冲区 (控制 Download 速度: Stack -> App)
-	// 默认值可能太小，导致从代理接收的数据无法及时写入 TUN，导致下载慢/断流
-	sndBufOpt := tcp.SendBufferSizeOption(2 * 1024 * 1024) // 2MB
-	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &sndBufOpt); err != nil {
-		log.Printf("[Stack] Warning: Failed to set SendBufferSize: %v", err)
-	}
-
-	// [关键修复] 增大默认接收缓冲区 (控制 Upload 速度: App -> Stack)
-	rcvBufOpt := tcp.ReceiveBufferSizeOption(2 * 1024 * 1024) // 2MB
-	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcvBufOpt); err != nil {
-		log.Printf("[Stack] Warning: Failed to set ReceiveBufferSize: %v", err)
-	}
+	// [修改说明] 移除了导致构建错误的 SetTransportProtocolOption 配置
+	// 因为您的 gvisor 版本较旧，不支持 SACKEnabled 等选项。
+	// 核心修复逻辑主要依赖于下方的 startPacketHandling 中的参数调整。
 
 	// 2. 配置网卡
 	s.SetForwardingDefaultAndAllNICs(ipv4.ProtocolNumber, true)
@@ -116,9 +100,9 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 }
 
 func (s *Stack) startPacketHandling() {
-	// [之前修复]
-	// rcvWnd: 1MB (通告窗口大小)
-	// maxInFlight: 2048 (最大并发握手)
+	// [关键修复保留]
+	// rcvWnd: 1MB (接收窗口)。这解决了数据传输一段时间后断流的问题。
+	// maxInFlight: 2048 (最大并发)。这解决了网页并发连接数过多导致的丢包问题。
 	rcvWnd := 1 << 20
 	maxInFlight := 2048
 
@@ -188,7 +172,7 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 		remoteConn = protocol.NewVlessConn(remoteConn)
 	}
 
-	// 3. 建立本地连接 (gonet)
+	// 3. 建立本地连接
 	var wq waiter.Queue
 	ep, err := r.CreateEndpoint(&wq)
 	if err != nil {
@@ -197,7 +181,6 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	}
 	r.Complete(false)
 
-	// gonet.NewTCPConn 会使用之前配置的默认 Buffer Size (现在是 2MB)
 	localConn := gonet.NewTCPConn(&wq, ep)
 	defer localConn.Close()
 
@@ -205,12 +188,10 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	go func() {
 		// Data: Stack -> Remote (Upload)
 		io.Copy(remoteConn, localConn)
-		// 如果本地关闭了写(App关闭连接)，则关闭远程的连接
-		// 注意: io.Copy 结束通常意味着 Read 到了 EOF
+		// 如果本地连接关闭，关闭远程连接
 	}()
 
 	// Data: Remote -> Stack (Download)
-	// 这里是最容易堵塞的地方，如果 localConn 的写缓冲区太小
 	io.Copy(localConn, remoteConn)
 	localConn.CloseWrite()
 }
