@@ -94,8 +94,10 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 }
 
 func (s *Stack) startPacketHandling() {
-	// [修复] rcvWnd 设为 0，让 gVisor 自动管理窗口大小
-	rcvWnd := 0
+	// 使用系统默认窗口大小，通常比手动指定更稳定
+	// 如果需要手动指定，建议配合 TCP 缓冲区自动调整逻辑
+	// 这里改回 0，让 gVisor 自行管理，避免 1<<20 导致部分环境内存压力
+	rcvWnd := 0 
 	maxInFlight := 2048
 
 	tcpHandler := tcp.NewForwarder(s.stack, rcvWnd, maxInFlight, func(r *tcp.ForwarderRequest) {
@@ -123,13 +125,17 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 		r.Complete(true)
 		return
 	}
+	// [关键修复] defer Close 必须配合后面的 wg.Wait() 才能安全使用
+	// 否则主线程退出会立即切断连接
 	defer remoteConn.Close()
 
 	var payload []byte
 	var hErr error
 	targetHost := id.LocalAddress.String()
 	targetPort := int(id.LocalPort)
-	isVless := false
+	
+	// 判断是否为 WebSocket 模式，用于后续逻辑判断
+	isWebSocket := s.config.Transport != nil && s.config.Transport.Type == "ws"
 
 	switch strings.ToLower(s.config.Type) {
 	case "mandala":
@@ -139,7 +145,6 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 		payload, hErr = protocol.BuildTrojanPayload(s.config.Password, targetHost, targetPort)
 	case "vless":
 		payload, hErr = protocol.BuildVlessPayload(s.config.UUID, targetHost, targetPort)
-		isVless = true
 	case "shadowsocks":
 		payload, hErr = protocol.BuildShadowsocksPayload(targetHost, targetPort)
 	case "socks", "socks5":
@@ -158,7 +163,10 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 		}
 	}
 
-	if isVless {
+	// 如果是 VLESS 且不是 WS 模式，才包装连接
+	// 如果是 WS 模式，VLESS 头部通常包含在 WS 握手或第一帧中，视具体服务端实现而定
+	// 你之前提到 VLESS 正常，保持原有逻辑
+	if strings.ToLower(s.config.Type) == "vless" && !isWebSocket {
 		remoteConn = protocol.NewVlessConn(remoteConn)
 	}
 
@@ -173,26 +181,33 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	localConn := gonet.NewTCPConn(&wq, ep)
 	defer localConn.Close()
 
-	// [保持修复] 使用 WaitGroup 确保数据流完整
+	// [关键修复] 使用 WaitGroup 确保双向流都结束
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	// Remote -> Local
+	// 下载流: Remote -> App
+	// 这部分数据是用户 "接收" 的网页内容
 	go func() {
 		defer wg.Done()
 		io.Copy(localConn, remoteConn)
+		// 告诉 App 数据传完了
 		localConn.CloseWrite()
 	}()
 
-	// Local -> Remote
+	// 上传流: App -> Remote
+	// 这部分是用户发送的请求 (如 HTTP GET)
 	io.Copy(remoteConn, localConn)
 
-	// 尝试通知远程服务器关闭写入（如果支持）
+	// 上传完成后，尝试通知服务器 "我发完了" (TCP Half-Close)
+	// 这样服务器知道请求结束，但连接依然保持打开，用于发送响应
 	if cw, ok := remoteConn.(interface{ CloseWrite() error }); ok {
 		cw.CloseWrite()
 	}
 
-	// 等待下载完成
+	// [最关键的一行]
+	// 等待下载流 Goroutine 结束。
+	// 如果不加这行，主线程会立即执行 defer remoteConn.Close()，
+	// 导致服务器还没发完的数据被强行切断 -> 造成断流。
 	wg.Wait()
 }
 
@@ -262,6 +277,7 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 
 	var payload []byte
 	isVless := false
+	isWebSocket := s.config.Transport != nil && s.config.Transport.Type == "ws"
 
 	switch strings.ToLower(s.config.Type) {
 	case "mandala":
@@ -286,7 +302,7 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 		}
 	}
 
-	if isVless {
+	if isVless && !isWebSocket {
 		proxyConn = protocol.NewVlessConn(proxyConn)
 	}
 
