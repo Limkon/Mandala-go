@@ -26,14 +26,15 @@ type Handler struct {
 func (h *Handler) HandleConnection(localConn net.Conn) {
 	defer localConn.Close()
 
-	// 设置初始读取超时，防止恶意连接挂起
+	// 1. 设置初始读取超时，防止恶意连接挂起
 	localConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
-	// 使用 bufio.Reader 以便“偷看”第一个字节而不消耗它
-	// 缓冲区大小设为 4KB，足够读取 HTTP 头部
+	// 使用 bufio.Reader 进行协议探测
+	// 关键修复：这个 reader 实例必须贯穿整个 local -> remote 的读取过程
+	// 否则 Peek 或 ReadRequest 读走的数据会在转发时丢失
 	bufReader := bufio.NewReaderSize(localConn, 4096)
 
-	// 偷看第一个字节
+	// 偷看第一个字节以判断协议
 	firstByte, err := bufReader.Peek(1)
 	if err != nil {
 		return
@@ -43,36 +44,37 @@ func (h *Handler) HandleConnection(localConn net.Conn) {
 	localConn.SetReadDeadline(time.Time{})
 
 	if firstByte[0] == 0x05 {
-		// SOCKS5 协议
+		// SOCKS5 协议处理
 		h.handleSocks5(localConn, bufReader)
 	} else {
-		// 尝试作为 HTTP 协议处理
+		// HTTP 协议处理（包括 CONNECT 和普通 GET/POST）
 		h.handleHttp(localConn, bufReader)
 	}
 }
 
-// handleSocks5 处理 SOCKS5 协议 (逻辑与 C 版本一致)
+// handleSocks5 处理 SOCKS5 协议 (逻辑与 C 版本对齐，修复了数据流丢失问题)
 func (h *Handler) handleSocks5(localConn net.Conn, reader *bufio.Reader) {
-	// 1. 握手阶段
-	// 读取版本和方法数
+	// 1. 握手阶段：协商认证方法
+	// 读取版本号和方法数量
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(reader, header); err != nil {
 		return
 	}
 
-	// 读取方法列表
+	// 读取方法列表并忽略（目前仅支持无需认证）
 	nMethods := int(header[1])
 	methods := make([]byte, nMethods)
 	if _, err := io.ReadFull(reader, methods); err != nil {
 		return
 	}
 
-	// 回复：无需认证
+	// 回复客户端：选择“无需认证”方法 (0x05 0x00)
 	if _, err := localConn.Write([]byte{0x05, 0x00}); err != nil {
 		return
 	}
 
-	// 2. 请求阶段
+	// 2. 请求阶段：读取 SOCKS5 CONNECT 请求
+	// 读取前 4 字节: [VER, CMD, RSV, ATYP]
 	requestHead := make([]byte, 4)
 	if _, err := io.ReadFull(reader, requestHead); err != nil {
 		return
@@ -86,18 +88,20 @@ func (h *Handler) handleSocks5(localConn net.Conn, reader *bufio.Reader) {
 	var targetPort int
 	atyp := requestHead[3]
 
+	// 解析目标地址
 	switch atyp {
-	case 0x01: // IPv4
+	case 0x01: // IPv4 地址
 		ip := make([]byte, 4)
 		io.ReadFull(reader, ip)
 		targetHost = net.IP(ip).String()
-	case 0x03: // Domain
+	case 0x03: // 域名
 		lenBuf := make([]byte, 1)
 		io.ReadFull(reader, lenBuf)
-		domain := make([]byte, int(lenBuf[0]))
+		domainLen := int(lenBuf[0])
+		domain := make([]byte, domainLen)
 		io.ReadFull(reader, domain)
 		targetHost = string(domain)
-	case 0x04: // IPv6 (Go 版本优势：C 版本此处主要丢弃，Go 可支持)
+	case 0x04: // IPv6 地址
 		ip := make([]byte, 16)
 		io.ReadFull(reader, ip)
 		targetHost = net.IP(ip).String()
@@ -105,63 +109,61 @@ func (h *Handler) handleSocks5(localConn net.Conn, reader *bufio.Reader) {
 		return
 	}
 
+	// 读取 2 字节端口号
 	portBuf := make([]byte, 2)
-	io.ReadFull(reader, portBuf)
+	if _, err := io.ReadFull(reader, portBuf); err != nil {
+		return
+	}
 	targetPort = int(portBuf[0])<<8 | int(portBuf[1])
 
-	// 3. 建立隧道
-	// 对于 SOCKS5，我们需要先回复客户端成功，再进行数据转发
-	// 注意：这里我们先尝试连接远程，成功后再回复客户端，这比 C 版本稍微安全一点
-	
-	// 连接远程节点
+	// 3. 建立远程连接
+	// 使用统一的 dialRemote 逻辑连接到服务器节点并完成协议握手
 	remoteConn, err := h.dialRemote(targetHost, targetPort)
 	if err != nil {
-		// 告诉客户端连接失败
+		// 通知本地客户端连接失败 (0x05 0x04: 主机不可达)
 		localConn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		log.Printf("[SOCKS5] 连接远程失败: %v", err)
 		return
 	}
 	defer remoteConn.Close()
 
-	// 告诉客户端连接成功
+	// 通知本地客户端连接成功 (0x05 0x00: 成功)
 	localConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
 	// 4. 双向转发
-	h.forward(localConn, remoteConn, nil) // nil 表示没有预读的数据需要发送
+	// 关键修复：从 reader 转发数据到 remote，确保不会丢失缓冲区内已读取的数据
+	h.forward(localConn, reader, remoteConn)
 }
-
-// handleHttp 处理 HTTP/HTTPS 代理请求 (移植 C 版本逻辑)
+// handleHttp 处理 HTTP 代理请求 (包括 HTTPS CONNECT 和普通 HTTP 请求)
 func (h *Handler) handleHttp(localConn net.Conn, reader *bufio.Reader) {
-	// 读取 HTTP 请求
+	// 1. 使用 http.ReadRequest 从具有缓冲的 reader 中解析请求
+	// 这确保了即使部分数据已被读取到缓冲区，解析依然正确
 	req, err := http.ReadRequest(reader)
 	if err != nil {
+		log.Printf("[HTTP] 解析请求失败: %v", err)
 		return
 	}
 
+	// 2. 提取目标主机和端口
 	targetHost := req.URL.Hostname()
 	targetPort := 80
-	portStr := req.URL.Port()
-	if portStr != "" {
+	if portStr := req.URL.Port(); portStr != "" {
 		p, _ := strconv.Atoi(portStr)
 		if p > 0 {
 			targetPort = p
 		}
-	} else {
-		if req.Method == http.MethodConnect {
-			targetPort = 443
-		}
+	} else if req.Method == http.MethodConnect {
+		targetPort = 443
 	}
 
-	// 某些请求 Host 可能在 Header 里而不在 URL 里
-	if targetHost == "" {
-		if req.Host != "" {
-			hostParts := strings.Split(req.Host, ":")
-			targetHost = hostParts[0]
-			if len(hostParts) > 1 {
-				p, _ := strconv.Atoi(hostParts[1])
-				if p > 0 {
-					targetPort = p
-				}
+	// 如果 URL 中未指定 Host，则从 Header 中提取
+	if targetHost == "" && req.Host != "" {
+		hostParts := strings.Split(req.Host, ":")
+		targetHost = hostParts[0]
+		if len(hostParts) > 1 {
+			p, _ := strconv.Atoi(hostParts[1])
+			if p > 0 {
+				targetPort = p
 			}
 		}
 	}
@@ -170,7 +172,7 @@ func (h *Handler) handleHttp(localConn net.Conn, reader *bufio.Reader) {
 		return
 	}
 
-	// 连接远程节点
+	// 3. 连接远程节点
 	remoteConn, err := h.dialRemote(targetHost, targetPort)
 	if err != nil {
 		log.Printf("[HTTP] 连接远程失败: %s:%d %v", targetHost, targetPort, err)
@@ -178,32 +180,29 @@ func (h *Handler) handleHttp(localConn net.Conn, reader *bufio.Reader) {
 	}
 	defer remoteConn.Close()
 
+	// 4. 根据请求方法处理后续逻辑
 	if req.Method == http.MethodConnect {
-		// HTTPS 隧道：回复 200 OK，后续纯透传
-		localConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-		
-		// 转发后续流量
-		h.forward(localConn, remoteConn, nil)
+		// HTTPS 隧道：回复客户端 200 OK
+		if _, err := localConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+			return
+		}
+		// 开始双向转发
+		h.forward(localConn, reader, remoteConn)
 	} else {
-		// 普通 HTTP 请求：需要把刚才读出来的 Header 发给远程服务器
-		// 因为 http.ReadRequest 消耗了缓冲区数据，我们需要重新组装
-		// 但更简单的方法是将 Request 对象重新写入远程连接
-		
-		// 1. 将解析过的请求头写入 Buffer
+		// 普通 HTTP 请求：需要将已解析并从缓冲区读出的请求重新发送给远程节点
 		var buf bytes.Buffer
-		req.Write(&buf) // 这会重构 HTTP 请求报文
-		
-		// 2. 将重构的报文发送给远程
+		if err := req.Write(&buf); err != nil {
+			return
+		}
 		if _, err := remoteConn.Write(buf.Bytes()); err != nil {
 			return
 		}
-		
-		// 3. 转发后续流量（Body 等）
-		h.forward(localConn, remoteConn, nil)
+		// 继续转发后续的 Body 或其他流数据
+		h.forward(localConn, reader, remoteConn)
 	}
 }
 
-// dialRemote 统一的远程连接和握手逻辑
+// dialRemote 统一处理远程代理服务器的连接与握手流程
 func (h *Handler) dialRemote(host string, port int) (net.Conn, error) {
 	dialer := NewDialer(h.Config)
 	remoteConn, err := dialer.Dial()
@@ -211,13 +210,14 @@ func (h *Handler) dialRemote(host string, port int) (net.Conn, error) {
 		return nil, err
 	}
 
-	// 设置握手超时
+	// 设置握手超时时间，防止连接卡死
 	remoteConn.SetDeadline(time.Now().Add(15 * time.Second))
 	
 	proxyType := strings.ToLower(h.Config.Type)
 	var finalConn net.Conn = remoteConn
 	var handshakeErr error
 
+	// 执行对应的远程协议握手
 	switch proxyType {
 	case "mandala":
 		client := protocol.NewMandalaClient(h.Config.Username, h.Config.Password)
@@ -230,8 +230,10 @@ func (h *Handler) dialRemote(host string, port int) (net.Conn, error) {
 
 	case "vless":
 		payload, _ := protocol.BuildVlessPayload(h.Config.UUID, host, port)
-		_, handshakeErr = remoteConn.Write(payload)
-		finalConn = protocol.NewVlessConn(remoteConn) // VLESS 需要特殊的流处理
+		if _, handshakeErr = remoteConn.Write(payload); handshakeErr == nil {
+			// VLESS 响应头剥离由 VlessConn 处理
+			finalConn = protocol.NewVlessConn(remoteConn)
+		}
 
 	case "shadowsocks":
 		payload, _ := protocol.BuildShadowsocksPayload(host, port)
@@ -246,37 +248,32 @@ func (h *Handler) dialRemote(host string, port int) (net.Conn, error) {
 		return nil, handshakeErr
 	}
 
-	// 清除超时
+	// 握手成功，清除超时设置
 	remoteConn.SetDeadline(time.Time{})
 	return finalConn, nil
 }
 
-// forward 双向数据转发
-func (h *Handler) forward(local net.Conn, remote net.Conn, initialData []byte) {
-	// 如果有预先读取的数据，先发送给远程
-	if len(initialData) > 0 {
-		if _, err := remote.Write(initialData); err != nil {
-			return
-		}
-	}
-
+// forward 实现高效的双向数据转发
+// 注意：localReader 必须是 HandleConnection 中创建的 bufio.Reader，以防数据丢失
+func (h *Handler) forward(local net.Conn, localReader *bufio.Reader, remote net.Conn) {
 	errChan := make(chan error, 2)
 
+	// 协程1: 本地 -> 远程 (从具有缓冲区的 localReader 读取)
 	go func() {
-		_, err := io.Copy(remote, local)
+		_, err := io.Copy(remote, localReader)
 		errChan <- err
-		// 确保关闭，触发另一端退出
 		remote.Close()
 		local.Close()
 	}()
 
+	// 协程2: 远程 -> 本地
 	go func() {
 		_, err := io.Copy(local, remote)
 		errChan <- err
-		// 确保关闭，触发另一端退出
 		local.Close()
 		remote.Close()
 	}()
 
+	// 等待任一方向结束
 	<-errChan
 }
