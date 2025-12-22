@@ -5,7 +5,6 @@ package proxy
 import (
 	"bufio"
 	"bytes"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -79,7 +78,7 @@ func (h *Handler) handleSocks5(localConn net.Conn, reader *bufio.Reader) {
 		return
 	}
 
-	if requestHead[1] != 0x01 { // 目前仅支持 CONNECT 命令
+	if requestHead[1] != 0x01 { // 仅支持 CONNECT 命令
 		return
 	}
 
@@ -113,7 +112,6 @@ func (h *Handler) handleSocks5(localConn net.Conn, reader *bufio.Reader) {
 	// 3. 建立隧道
 	// 对于 SOCKS5，我们需要先回复客户端成功，再进行数据转发
 	// 注意：这里我们先尝试连接远程，成功后再回复客户端，这比 C 版本稍微安全一点
-	// C 版本是先回复成功再连接，Go 这里保持逻辑健壮性，若需完全一致可调整顺序
 	
 	// 连接远程节点
 	remoteConn, err := h.dialRemote(targetHost, targetPort)
