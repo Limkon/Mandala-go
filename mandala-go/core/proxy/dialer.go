@@ -29,22 +29,25 @@ func NewDialer(cfg *config.OutboundConfig) *Dialer {
 
 func (d *Dialer) Dial() (net.Conn, error) {
 	targetAddr := fmt.Sprintf("%s:%d", d.Config.Server, d.Config.ServerPort)
-	
-	// [优化] 使用更底层的 Dialer 来配置 KeepAlive
+
+	// 使用更底层的 Dialer 来配置 KeepAlive
 	dialer := &net.Dialer{
 		Timeout:   5 * time.Second,
 		KeepAlive: 30 * time.Second, // 30秒发送一次心跳，防止死连接
 	}
-	
+
 	conn, err := dialer.Dial("tcp", targetAddr)
 	if err != nil {
 		return nil, err
 	}
 
-	// [优化] 开启 TCP NoDelay，减少延迟
+	// 开启 TCP NoDelay，减少延迟
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
-		tcpConn.SetLinger(0)
+		// [修复] 移除 SetLinger(0) 或设置为 -1 (默认)。
+		// SetLinger(0) 会导致 Close() 时直接丢弃缓冲区未发出的数据并发送 RST，
+		// 这在网络拥堵或高延迟时极易导致数据传输不完整。
+		tcpConn.SetLinger(-1)
 	}
 
 	// TLS 处理
@@ -57,7 +60,7 @@ func (d *Dialer) Dial() (net.Conn, error) {
 		if tlsConfig.ServerName == "" {
 			tlsConfig.ServerName = d.Config.Server
 		}
-		
+
 		tlsConn := tls.Client(conn, tlsConfig)
 		if err := tlsConn.Handshake(); err != nil {
 			conn.Close()
@@ -81,9 +84,13 @@ func (d *Dialer) Dial() (net.Conn, error) {
 
 func (d *Dialer) handshakeWebSocket(conn net.Conn) (net.Conn, error) {
 	path := d.Config.Transport.Path
-	if path == "" { path = "/" }
+	if path == "" {
+		path = "/"
+	}
 	host := d.Config.TLS.ServerName
-	if host == "" { host = d.Config.Server }
+	if host == "" {
+		host = d.Config.Server
+	}
 
 	key := make([]byte, 16)
 	rand.Read(key)
@@ -122,7 +129,7 @@ func (d *Dialer) handshakeWebSocket(conn net.Conn) (net.Conn, error) {
 type WSConn struct {
 	net.Conn
 	reader    *bufio.Reader
-	remaining int64 
+	remaining int64
 }
 
 func NewWSConn(c net.Conn, br *bufio.Reader) *WSConn {
@@ -131,7 +138,9 @@ func NewWSConn(c net.Conn, br *bufio.Reader) *WSConn {
 
 func (w *WSConn) Write(b []byte) (int, error) {
 	length := len(b)
-	if length == 0 { return 0, nil }
+	if length == 0 {
+		return 0, nil
+	}
 
 	buf := make([]byte, 0, 14+length)
 	buf = append(buf, 0x82) // Binary Frame
@@ -152,7 +161,7 @@ func (w *WSConn) Write(b []byte) (int, error) {
 
 	payloadStart := len(buf)
 	buf = append(buf, b...)
-	
+
 	for i := 0; i < length; i++ {
 		buf[payloadStart+i] ^= maskKey[i%4]
 	}
@@ -167,46 +176,69 @@ func (w *WSConn) Read(b []byte) (int, error) {
 	for {
 		if w.remaining > 0 {
 			limit := int64(len(b))
-			if w.remaining < limit { limit = w.remaining }
+			if w.remaining < limit {
+				limit = w.remaining
+			}
 			n, err := w.reader.Read(b[:limit])
-			if n > 0 { w.remaining -= int64(n) }
-			if n > 0 || err != nil { return n, err }
+			if n > 0 {
+				w.remaining -= int64(n)
+			}
+			if n > 0 || err != nil {
+				return n, err
+			}
 		}
 
 		header, err := w.reader.ReadByte()
-		if err != nil { return 0, err }
-		
+		if err != nil {
+			return 0, err
+		}
+
 		opcode := header & 0x0F
 		lenByte, err := w.reader.ReadByte()
-		if err != nil { return 0, err }
+		if err != nil {
+			return 0, err
+		}
 
 		masked := (lenByte & 0x80) != 0
 		payloadLen := int64(lenByte & 0x7F)
 
 		if payloadLen == 126 {
 			lenBuf := make([]byte, 2)
-			if _, err := io.ReadFull(w.reader, lenBuf); err != nil { return 0, err }
+			if _, err := io.ReadFull(w.reader, lenBuf); err != nil {
+				return 0, err
+			}
 			payloadLen = int64(binary.BigEndian.Uint16(lenBuf))
 		} else if payloadLen == 127 {
 			lenBuf := make([]byte, 8)
-			if _, err := io.ReadFull(w.reader, lenBuf); err != nil { return 0, err }
+			if _, err := io.ReadFull(w.reader, lenBuf); err != nil {
+				return 0, err
+			}
 			payloadLen = int64(binary.BigEndian.Uint64(lenBuf))
 		}
 
 		if masked {
-			if _, err := io.CopyN(io.Discard, w.reader, 4); err != nil { return 0, err }
+			if _, err := io.CopyN(io.Discard, w.reader, 4); err != nil {
+				return 0, err
+			}
 		}
 
 		switch opcode {
-		case 0x8: return 0, io.EOF
+		case 0x8:
+			return 0, io.EOF
 		case 0x9, 0xA:
-			if payloadLen > 0 { io.CopyN(io.Discard, w.reader, payloadLen) }
+			if payloadLen > 0 {
+				io.CopyN(io.Discard, w.reader, payloadLen)
+			}
 			continue
 		case 0x0, 0x1, 0x2:
 			w.remaining = payloadLen
-			if w.remaining == 0 { continue }
+			if w.remaining == 0 {
+				continue
+			}
 		default:
-			if payloadLen > 0 { io.CopyN(io.Discard, w.reader, payloadLen) }
+			if payloadLen > 0 {
+				io.CopyN(io.Discard, w.reader, payloadLen)
+			}
 			continue
 		}
 	}
