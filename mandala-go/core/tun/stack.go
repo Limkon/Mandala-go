@@ -7,7 +7,7 @@ import (
 	"log"
 	"net"
 	"strings"
-	"sync"
+	"sync" // [新增] 引入 sync 包
 	"time"
 
 	"mandala/core/config"
@@ -94,12 +94,8 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 }
 
 func (s *Stack) startPacketHandling() {
-	// [关键修复]
-	// 原来的 30000 太小，导致接收一点数据后窗口填满，停止接收。
-	// 修改为 1MB (1<<20) 以支持连续数据传输。
-	// 原来的 10 太小，导致网页并发连接被丢弃。
-	// 修改为 2048。
-	rcvWnd := 1 << 20 
+	// 窗口大小设置为 1MB，飞行数据包设置为 2048，确保高吞吐量
+	rcvWnd := 1 << 20
 	maxInFlight := 2048
 
 	tcpHandler := tcp.NewForwarder(s.stack, rcvWnd, maxInFlight, func(r *tcp.ForwarderRequest) {
@@ -177,16 +173,30 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	localConn := gonet.NewTCPConn(&wq, ep)
 	defer localConn.Close()
 
-	// 双向转发
+	// [关键修复] 使用 WaitGroup 确保双向转发都完成后再关闭连接
+	// 避免主线程因为“上传完成”就立即退出并关闭 RemoteConn，导致“下载”被中断。
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	// 下载流: Remote -> App
 	go func() {
-		// 上行: App -> Remote
+		defer wg.Done()
 		io.Copy(localConn, remoteConn)
+		// 告诉 App 端数据发完了（半关闭），但通常 LocalConn (gVisor) 会自己处理 FIN
 		localConn.CloseWrite()
 	}()
 
-	// 下行: Remote -> App
-	// 如果这里断流，通常是 localConn 写缓冲区满了 (因为 rcvWnd 太小)
+	// 上传流: App -> Remote
 	io.Copy(remoteConn, localConn)
+
+	// [修复] 上传完成后，尝试对远程连接执行半关闭（发送 TCP FIN）。
+	// 这告诉服务器：“我的请求发完了，请发响应给我”，而不是直接发 RST。
+	if cw, ok := remoteConn.(interface{ CloseWrite() error }); ok {
+		cw.CloseWrite()
+	}
+
+	// 等待下载流结束
+	wg.Wait()
 }
 
 func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
@@ -309,9 +319,15 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 
 func (s *Stack) Close() {
 	s.closeOnce.Do(func() {
-		if s.cancel != nil { s.cancel() }
+		if s.cancel != nil {
+			s.cancel()
+		}
 		time.Sleep(100 * time.Millisecond)
-		if s.device != nil { s.device.Close() }
-		if s.stack != nil { s.stack.Close() }
+		if s.device != nil {
+			s.device.Close()
+		}
+		if s.stack != nil {
+			s.stack.Close()
+		}
 	})
 }
