@@ -9,22 +9,15 @@ import (
 	"net"
 )
 
-// HandshakeSocks5 实现了支持认证的 SOCKS5 客户端握手协议
+// HandshakeSocks5 实现与 Cloudflare Worker (SOCKS5 认证模式) 的精準對接
 func HandshakeSocks5(conn net.Conn, user, pass, host string, port int) error {
-	// 1. 发送版本和支持的认证方法
-	// 同时宣告支持无需认证(0x00)和用户名密码认证(0x02)
-	if user != "" && pass != "" {
-		if _, err := conn.Write([]byte{0x05, 0x02, 0x00, 0x02}); err != nil {
-			return err
-		}
-	} else {
-		if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
-			return err
-		}
+	// 1. 发送版本和支持的方法
+	// 宣告支持 0x00 (无需认证) 和 0x02 (用户密码认证)
+	if _, err := conn.Write([]byte{0x05, 0x02, 0x00, 0x02}); err != nil {
+		return err
 	}
 
 	// 2. 读取服务端选择的方法
-	// 严格读取 2 个字节 [VER, METHOD]
 	methodBuf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, methodBuf); err != nil {
 		return fmt.Errorf("read method selection failed: %v", err)
@@ -35,13 +28,13 @@ func HandshakeSocks5(conn net.Conn, user, pass, host string, port int) error {
 	}
 
 	// 3. 处理认证
+	// 如果服务端返回 0x02，则执行 RFC 1929 认证
 	if methodBuf[1] == 0x02 {
-		// 服务端要求用户名/密码认证
 		if user == "" || pass == "" {
-			return errors.New("server requires auth but no credentials provided")
+			return errors.New("server chose auth but no credentials provided")
 		}
 
-		// 构造认证包: [VER(0x01), ULEN, USER, PLEN, PASS]
+		// 认证包: [1, ULEN, USER, PLEN, PASS]
 		authBuf := make([]byte, 0, 3+len(user)+len(pass))
 		authBuf = append(authBuf, 0x01)
 		authBuf = append(authBuf, byte(len(user)))
@@ -50,25 +43,23 @@ func HandshakeSocks5(conn net.Conn, user, pass, host string, port int) error {
 		authBuf = append(authBuf, []byte(pass)...)
 
 		if _, err := conn.Write(authBuf); err != nil {
-			return fmt.Errorf("write auth failed: %v", err)
+			return err
 		}
 
-		// 读取认证响应: [VER, STATUS]
+		// 读取认证响应: [1, STATUS]
 		resBuf := make([]byte, 2)
 		if _, err := io.ReadFull(conn, resBuf); err != nil {
-			return fmt.Errorf("read auth response failed: %v", err)
+			return fmt.Errorf("read auth status failed: %v", err)
 		}
 
-		if resBuf[1] != 0x00 { // 状态码 0x00 表示成功
-			return errors.New("socks5 authentication failed")
+		if resBuf[1] != 0x00 {
+			return errors.New("socks5 authentication failed at remote server")
 		}
-
 	} else if methodBuf[1] != 0x00 {
-		return fmt.Errorf("unsupported auth method: %d", methodBuf[1])
+		return fmt.Errorf("server rejected auth methods: %d", methodBuf[1])
 	}
 
-	// 4. 发送连接请求 (CONNECT)
-	// 格式: [VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT]
+	// 4. 发送 CONNECT 请求
 	req := []byte{0x05, 0x01, 0x00}
 	addrBytes, err := ToSocksAddr(host, port)
 	if err != nil {
@@ -77,13 +68,11 @@ func HandshakeSocks5(conn net.Conn, user, pass, host string, port int) error {
 	req = append(req, addrBytes...)
 
 	if _, err := conn.Write(req); err != nil {
-		return fmt.Errorf("write connect request failed: %v", err)
+		return err
 	}
 
-	// 5. 读取连接响应 (BND.ADDR/PORT)
-	// 精确读取，防止吃掉后续业务数据
-	
-	// 先读前 4 个字节: [VER, REP, RSV, ATYP]
+	// 5. 读取 SOCKS5 响应 (严格对齐服务端的 10 位元組回應)
+	// 服务端固定返回: [5, 0, 0, 1, 0, 0, 0, 0, 0, 0]
 	head := make([]byte, 4)
 	if _, err := io.ReadFull(conn, head); err != nil {
 		return fmt.Errorf("read connect response head failed: %v", err)
@@ -93,30 +82,25 @@ func HandshakeSocks5(conn net.Conn, user, pass, host string, port int) error {
 		return fmt.Errorf("socks5 connect failed with status: 0x%02x", head[1])
 	}
 
-	// 根据 ATYP (地址类型) 决定还需要读多少字节
 	var addrLen int
 	switch head[3] {
 	case 0x01: // IPv4
 		addrLen = 4
 	case 0x03: // Domain
 		lenByte := make([]byte, 1)
-		if _, err := io.ReadFull(conn, lenByte); err != nil {
-			return err
-		}
+		io.ReadFull(conn, lenByte)
 		addrLen = int(lenByte[0])
 	case 0x04: // IPv6
 		addrLen = 16
 	default:
-		return fmt.Errorf("unknown address type: %d", head[3])
+		return fmt.Errorf("unknown ATYP: %d", head[3])
 	}
 
-	// 读取剩余的地址内容 + 2字节端口
-	restSize := addrLen + 2
-	rest := make([]byte, restSize)
+	// 读取地址内容和 2 字节端口
+	rest := make([]byte, addrLen+2)
 	if _, err := io.ReadFull(conn, rest); err != nil {
-		return fmt.Errorf("read connect response body failed: %v", err)
+		return err
 	}
 
-	// 握手完成
 	return nil
 }
