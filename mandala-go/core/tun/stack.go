@@ -41,6 +41,7 @@ type Stack struct {
 }
 
 func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
+	// [调试] 打印传入的 MTU，如果这里显示 1500，则说明 Android 端未正确设置
 	log.Printf("[Stack] 启动中 (FD: %d, MTU: %d, Type: %s)", fd, mtu, cfg.Type)
 
 	dev, err := NewDevice(fd, uint32(mtu))
@@ -60,9 +61,8 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 		},
 	})
 
-	// [修改说明] 移除了导致构建错误的 SetTransportProtocolOption 配置
-	// 因为您的 gvisor 版本较旧，不支持 SACKEnabled 等选项。
-	// 核心修复逻辑主要依赖于下方的 startPacketHandling 中的参数调整。
+	// 注意：移除了旧版 gVisor 不支持的 SACK/BufferSize 选项
+	// 性能优化主要依赖下方的 startPacketHandling
 
 	// 2. 配置网卡
 	s.SetForwardingDefaultAndAllNICs(ipv4.ProtocolNumber, true)
@@ -100,9 +100,9 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 }
 
 func (s *Stack) startPacketHandling() {
-	// [关键修复保留]
-	// rcvWnd: 1MB (接收窗口)。这解决了数据传输一段时间后断流的问题。
-	// maxInFlight: 2048 (最大并发)。这解决了网页并发连接数过多导致的丢包问题。
+	// [关键优化]
+	// rcvWnd: 1MB (接收窗口)。解决断流问题。
+	// maxInFlight: 2048 (最大并发)。解决网页并发连接丢失。
 	rcvWnd := 1 << 20
 	maxInFlight := 2048
 
@@ -153,6 +153,7 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	case "shadowsocks":
 		payload, hErr = protocol.BuildShadowsocksPayload(targetHost, targetPort)
 	case "socks", "socks5":
+		// 注意：请确保您已应用之前提供的 socks5.go 修复 (严格无缓冲读取)
 		hErr = protocol.HandshakeSocks5(remoteConn, s.config.Username, s.config.Password, targetHost, targetPort)
 	}
 
@@ -186,13 +187,12 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 
 	// 4. 双向转发
 	go func() {
-		// Data: Stack -> Remote (Upload)
 		io.Copy(remoteConn, localConn)
-		// 如果本地连接关闭，关闭远程连接
+		// 远程写入关闭通常不需要特别处理，依赖 defer Close
 	}()
 
-	// Data: Remote -> Stack (Download)
 	io.Copy(localConn, remoteConn)
+	// 本地连接写入端关闭
 	localConn.CloseWrite()
 }
 
