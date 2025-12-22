@@ -13,6 +13,7 @@ import (
 )
 
 // Handler 处理单个本地连接
+// (此文件如果被用于直连拨号或旧版本遗留，同样需要修复转发逻辑)
 type Handler struct {
 	Config *config.OutboundConfig
 }
@@ -145,7 +146,6 @@ func (h *Handler) HandleConnection(localConn net.Conn) {
 		return
 	}
 
-	// 如果是 VLESS，包装连接以剥离响应头
 	if isVless {
 		remoteConn = protocol.NewVlessConn(remoteConn)
 	}
@@ -155,42 +155,49 @@ func (h *Handler) HandleConnection(localConn net.Conn) {
 		return
 	}
 
-	// 6. 双向转发（关键修改：防止碎片化）
+	// 6. 双向转发 (优化版：处理半关闭)
 	localConn.SetDeadline(time.Time{})
 	remoteConn.SetDeadline(time.Time{})
 
-	// 优化：设置 TCP NoDelay 和 MSS，限制缓冲大小
 	if tcpl, ok := localConn.(*net.TCPConn); ok {
 		tcpl.SetNoDelay(true)
+		tcpl.SetKeepAlive(true)
+		tcpl.SetKeepAlivePeriod(30 * time.Second)
 	}
 	if tcpr, ok := remoteConn.(*net.TCPConn); ok {
 		tcpr.SetNoDelay(true)
-		// 设置 TCP MSS = 1360（对应 MTU 1400），防止碎片
+		tcpr.SetKeepAlive(true)
+		tcpr.SetKeepAlivePeriod(30 * time.Second)
 		if f, err := tcpr.File(); err == nil {
 			_ = syscall.SetsockoptInt(int(f.Fd()), syscall.IPPROTO_TCP, syscall.TCP_MAXSEG, 1360)
 		}
 	}
 
-	// 使用固定小缓冲区
-	buf := make([]byte, 1400)
+	done := make(chan struct{}, 2)
 
-	errChan := make(chan error, 2)
+	// 上行
 	go func() {
-		_, err := io.CopyBuffer(remoteConn, localConn, buf)
-		errChan <- err
+		io.Copy(remoteConn, localConn)
+		if tcpRemote, ok := remoteConn.(*net.TCPConn); ok {
+			tcpRemote.CloseWrite()
+		} else if cw, ok := remoteConn.(interface{ CloseWrite() error }); ok {
+			cw.CloseWrite()
+		}
+		done <- struct{}{}
 	}()
+
+	// 下行
 	go func() {
-		_, err := io.CopyBuffer(localConn, remoteConn, buf)
-		errChan <- err
+		io.Copy(localConn, remoteConn)
+		if tcpLocal, ok := localConn.(*net.TCPConn); ok {
+			tcpLocal.CloseWrite()
+		}
+		done <- struct{}{}
 	}()
 
-	// 等待任一方向结束（修复：用 = 赋值，而不是 := 声明）
-	err = <-errChan
-	if err != nil && err != io.EOF {
-		log.Printf("[Proxy] Relay error: %v", err)
-	}
+	<-done
+	<-done
 
-	// 关闭连接
 	localConn.Close()
 	remoteConn.Close()
 }
