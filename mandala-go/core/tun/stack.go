@@ -41,7 +41,7 @@ type Stack struct {
 }
 
 func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
-	log.Printf("[Stack] 啟動中 (FD: %d, MTU: %d, Type: %s)", fd, mtu, cfg.Type)
+	log.Printf("[Stack] 启动中 (FD: %d, MTU: %d, Type: %s)", fd, mtu, cfg.Type)
 
 	dev, err := NewDevice(fd, uint32(mtu))
 	if err != nil {
@@ -63,9 +63,10 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 	s.SetForwardingDefaultAndAllNICs(ipv6.ProtocolNumber, true)
 
 	nicID := tcpip.NICID(1)
+
 	if err := s.CreateNIC(nicID, dev.LinkEndpoint()); err != nil {
 		dev.Close()
-		return nil, fmt.Errorf("創建網卡失敗: %v", err)
+		return nil, fmt.Errorf("创建网卡失败: %v", err)
 	}
 
 	s.SetPromiscuousMode(nicID, true)
@@ -94,10 +95,7 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 }
 
 func (s *Stack) startPacketHandling() {
-	rcvWnd := 0
-	maxInFlight := 2048
-
-	tcpHandler := tcp.NewForwarder(s.stack, rcvWnd, maxInFlight, func(r *tcp.ForwarderRequest) {
+	tcpHandler := tcp.NewForwarder(s.stack, 30000, 10, func(r *tcp.ForwarderRequest) {
 		go s.handleTCP(r)
 	})
 	s.stack.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpHandler.HandlePacket)
@@ -117,6 +115,7 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 
 	id := r.ID()
 
+	// 1. 拨号代理
 	remoteConn, dialErr := s.dialer.Dial()
 	if dialErr != nil {
 		r.Complete(true)
@@ -124,12 +123,12 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	}
 	defer remoteConn.Close()
 
+	// 2. 握手
 	var payload []byte
 	var hErr error
 	targetHost := id.LocalAddress.String()
 	targetPort := int(id.LocalPort)
-
-	isWebSocket := s.config.Transport != nil && s.config.Transport.Type == "ws"
+	isVless := false
 
 	switch strings.ToLower(s.config.Type) {
 	case "mandala":
@@ -139,88 +138,67 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 		payload, hErr = protocol.BuildTrojanPayload(s.config.Password, targetHost, targetPort)
 	case "vless":
 		payload, hErr = protocol.BuildVlessPayload(s.config.UUID, targetHost, targetPort)
+		isVless = true
+
+	// [新增] Shadowsocks
 	case "shadowsocks":
 		payload, hErr = protocol.BuildShadowsocksPayload(targetHost, targetPort)
+
+	// [新增] SOCKS5 (交互式握手，无 Payload 生成)
 	case "socks", "socks5":
 		hErr = protocol.HandshakeSocks5(remoteConn, s.config.Username, s.config.Password, targetHost, targetPort)
 	}
 
 	if hErr != nil {
-		log.Printf("[TCP] Handshake failed for %s:%d: %v", targetHost, targetPort, hErr)
 		r.Complete(true)
 		return
 	}
 
+	// 发送握手包 (适用于 Mandala, Trojan, Vless, Shadowsocks)
 	if len(payload) > 0 {
 		if _, err := remoteConn.Write(payload); err != nil {
-			log.Printf("[TCP] Write payload failed: %v", err)
 			r.Complete(true)
 			return
 		}
 	}
 
-	switch strings.ToLower(s.config.Type) {
-	case "vless":
-		if !isWebSocket {
-			remoteConn = protocol.NewVlessConn(remoteConn)
-		}
-	case "socks", "socks5":
-	case "shadowsocks":
-		buf := make([]byte, 1024)
-		remoteConn.SetReadDeadline(time.Now().Add(3 * time.Second))
-		n, _ := remoteConn.Read(buf)
-		if n > 0 {
-			log.Printf("[SS] Discarded %d bytes of pre-response", n)
-		}
-		remoteConn.SetReadDeadline(time.Time{})
-	default:
+	// 如果是 VLESS，应用响应头剥离器
+	if isVless {
+		remoteConn = protocol.NewVlessConn(remoteConn)
 	}
 
+	// 3. 建立本地连接
 	var wq waiter.Queue
 	ep, err := r.CreateEndpoint(&wq)
 	if err != nil {
-		log.Printf("[TCP] CreateEndpoint failed: %v", err)
 		r.Complete(true)
 		return
 	}
+	r.Complete(false)
 
 	localConn := gonet.NewTCPConn(&wq, ep)
 	defer localConn.Close()
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-
+	// 4. 双向转发
 	go func() {
-		defer wg.Done()
-		n, err := io.Copy(remoteConn, localConn)
-		log.Printf("[TCP] Up: %d bytes, err=%v", n, err)
-		if cw, ok := remoteConn.(interface{ CloseWrite() error }); ok {
-			cw.CloseWrite()
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		n, err := io.Copy(localConn, remoteConn)
-		log.Printf("[TCP] Down: %d bytes, err=%v", n, err)
+		io.Copy(localConn, remoteConn)
 		localConn.CloseWrite()
 	}()
 
-	wg.Wait()
-	r.Complete(false)
+	io.Copy(remoteConn, localConn)
 }
 
 func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 	id := r.ID()
 	targetPort := int(id.LocalPort)
 
+	// [DNS处理] 拦截 53 端口
 	if targetPort == 53 {
 		var wq waiter.Queue
 		ep, err := r.CreateEndpoint(&wq)
 		if err != nil {
 			return
 		}
-		// [修復] 恢復為 3 個參數，加入 s.stack
 		localConn := gonet.NewUDPConn(s.stack, &wq, ep)
 		go s.handleRemoteDNS(localConn)
 		return
@@ -235,15 +213,16 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 		return
 	}
 
-	// [修復] 恢復為 3 個參數，加入 s.stack
 	localConn := gonet.NewUDPConn(s.stack, &wq, ep)
 
+	// UDP NAT 逻辑
 	session, natErr := s.nat.GetOrCreate(srcKey, localConn, targetIP, targetPort)
 	if natErr != nil {
 		localConn.Close()
 		return
 	}
 
+	// Local -> Remote 转发
 	go func() {
 		defer localConn.Close()
 		buf := make([]byte, 4096)
@@ -270,15 +249,17 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 		return
 	}
 
+	// 1. 连接代理
 	proxyConn, err := s.dialer.Dial()
 	if err != nil {
+		log.Printf("[DNS] 代理连接失败: %v", err)
 		return
 	}
 	defer proxyConn.Close()
 
+	// 2. 发送握手
 	var payload []byte
 	isVless := false
-	isWebSocket := s.config.Transport != nil && s.config.Transport.Type == "ws"
 
 	switch strings.ToLower(s.config.Type) {
 	case "mandala":
@@ -289,10 +270,15 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 	case "vless":
 		payload, _ = protocol.BuildVlessPayload(s.config.UUID, "8.8.8.8", 53)
 		isVless = true
+
+	// [新增] Shadowsocks
 	case "shadowsocks":
 		payload, _ = protocol.BuildShadowsocksPayload("8.8.8.8", 53)
+
+	// [新增] SOCKS5
 	case "socks", "socks5":
 		if err := protocol.HandshakeSocks5(proxyConn, s.config.Username, s.config.Password, "8.8.8.8", 53); err != nil {
+			log.Printf("[DNS] Socks5握手失败: %v", err)
 			return
 		}
 	}
@@ -303,10 +289,11 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 		}
 	}
 
-	if isVless && !isWebSocket {
+	if isVless {
 		proxyConn = protocol.NewVlessConn(proxyConn)
 	}
 
+	// 3. 封装 DNS
 	reqData := make([]byte, 2+n)
 	reqData[0] = byte(n >> 8)
 	reqData[1] = byte(n)
@@ -316,6 +303,7 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 		return
 	}
 
+	// 4. 读取响应
 	lenBuf := make([]byte, 2)
 	if _, err := io.ReadFull(proxyConn, lenBuf); err != nil {
 		return
@@ -327,21 +315,29 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 		return
 	}
 
+	// 5. 写回 Android
 	conn.Write(respBuf)
 	log.Printf("[DNS] 解析完成")
 }
 
 func (s *Stack) Close() {
 	s.closeOnce.Do(func() {
+		log.Println("[Stack] Stopping...")
+
 		if s.cancel != nil {
 			s.cancel()
 		}
+
 		time.Sleep(100 * time.Millisecond)
+
 		if s.device != nil {
 			s.device.Close()
 		}
+
 		if s.stack != nil {
 			s.stack.Close()
 		}
+
+		log.Println("[Stack] Stopped.")
 	})
 }

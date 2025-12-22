@@ -10,13 +10,15 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"sync"
 	"time"
 
 	"mandala/core/config"
 )
 
 func init() {
+	// [修復] 初始化隨機數種子。
+	// 客戶端發送 WebSocket 幀必須進行 Mask 加密，
+	// 如果不初始化種子，Mask Key 將固定，會被部分防火牆識別。
 	rand.Seed(time.Now().UnixNano())
 }
 
@@ -30,23 +32,11 @@ func NewDialer(cfg *config.OutboundConfig) *Dialer {
 
 func (d *Dialer) Dial() (net.Conn, error) {
 	targetAddr := fmt.Sprintf("%s:%d", d.Config.Server, d.Config.ServerPort)
-
-	dialer := &net.Dialer{
-		Timeout:   10 * time.Second, // 增加连接超时
-		KeepAlive: 30 * time.Second,
-	}
-
-	conn, err := dialer.Dial("tcp", targetAddr)
+	conn, err := net.DialTimeout("tcp", targetAddr, 5*time.Second)
 	if err != nil {
 		return nil, err
 	}
 
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetNoDelay(true)
-		tcpConn.SetLinger(-1) // 保持默认优雅关闭
-	}
-
-	// TLS 处理
 	if d.Config.TLS != nil && d.Config.TLS.Enabled {
 		tlsConfig := &tls.Config{
 			ServerName:         d.Config.TLS.ServerName,
@@ -56,9 +46,8 @@ func (d *Dialer) Dial() (net.Conn, error) {
 		if tlsConfig.ServerName == "" {
 			tlsConfig.ServerName = d.Config.Server
 		}
-
+		
 		tlsConn := tls.Client(conn, tlsConfig)
-		// 显式握手以尽早发现 TLS 错误
 		if err := tlsConn.Handshake(); err != nil {
 			conn.Close()
 			return nil, fmt.Errorf("tls handshake failed: %v", err)
@@ -66,7 +55,6 @@ func (d *Dialer) Dial() (net.Conn, error) {
 		conn = tlsConn
 	}
 
-	// WebSocket 处理
 	if d.Config.Transport != nil && d.Config.Transport.Type == "ws" {
 		wsConn, err := d.handshakeWebSocket(conn)
 		if err != nil {
@@ -81,32 +69,20 @@ func (d *Dialer) Dial() (net.Conn, error) {
 
 func (d *Dialer) handshakeWebSocket(conn net.Conn) (net.Conn, error) {
 	path := d.Config.Transport.Path
-	if path == "" {
-		path = "/"
-	}
+	if path == "" { path = "/" }
 	host := d.Config.TLS.ServerName
-	if host == "" {
-		host = d.Config.Server
-	}
+	if host == "" { host = d.Config.Server }
 
 	key := make([]byte, 16)
 	rand.Read(key)
 	keyStr := base64.StdEncoding.EncodeToString(key)
 
-	// [修复] 完善请求头，伪装成浏览器并禁用压缩
-	// 1. User-Agent: 防止被 CF 拦截
-	// 2. Origin: 很多 WS 服务端校验此头
-	// 3. Sec-WebSocket-Extensions: 留空表示不支持压缩，防止服务器发送压缩数据导致解析失败
 	req := fmt.Sprintf("GET %s HTTP/1.1\r\n"+
 		"Host: %s\r\n"+
 		"Upgrade: websocket\r\n"+
 		"Connection: Upgrade\r\n"+
 		"Sec-WebSocket-Key: %s\r\n"+
-		"Sec-WebSocket-Version: 13\r\n"+
-		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"+
-		"Origin: https://%s\r\n"+
-		"Sec-WebSocket-Extensions: \r\n", 
-		path, host, keyStr, host)
+		"Sec-WebSocket-Version: 13\r\n", path, host, keyStr)
 
 	if d.Config.Transport.Headers != nil {
 		for k, v := range d.Config.Transport.Headers {
@@ -124,13 +100,8 @@ func (d *Dialer) handshakeWebSocket(conn net.Conn) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	
-	// 检查状态码
 	if resp.StatusCode != 101 {
-		// 读取并在日志中显示可能的错误信息
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		resp.Body.Close()
-		return nil, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
 	return NewWSConn(conn, br), nil
@@ -139,27 +110,20 @@ func (d *Dialer) handshakeWebSocket(conn net.Conn) (net.Conn, error) {
 type WSConn struct {
 	net.Conn
 	reader    *bufio.Reader
-	remaining int64
-	writeMu   sync.Mutex
+	remaining int64 
 }
 
 func NewWSConn(c net.Conn, br *bufio.Reader) *WSConn {
 	return &WSConn{Conn: c, reader: br, remaining: 0}
 }
 
-// writeFrame 写入 WebSocket 帧
-func (w *WSConn) writeFrame(opcode byte, payload []byte) (int, error) {
-	w.writeMu.Lock()
-	defer w.writeMu.Unlock()
+func (w *WSConn) Write(b []byte) (int, error) {
+	length := len(b)
+	if length == 0 { return 0, nil }
 
-	length := len(payload)
-	// 预分配最大可能需要的缓冲 (Header=14 + Payload)
 	buf := make([]byte, 0, 14+length)
-	
-	// FIN=1 | Opcode
-	buf = append(buf, 0x80|opcode)
+	buf = append(buf, 0x82) // Binary Frame
 
-	// Mask bit set (Client-to-Server 必须 Mask)
 	if length < 126 {
 		buf = append(buf, byte(length)|0x80)
 	} else if length <= 65535 {
@@ -171,13 +135,12 @@ func (w *WSConn) writeFrame(opcode byte, payload []byte) (int, error) {
 	}
 
 	maskKey := make([]byte, 4)
-	rand.Read(maskKey) // 使用 math/rand 生成简单的 Mask Key
+	rand.Read(maskKey)
 	buf = append(buf, maskKey...)
 
-	// 将 payload 追加到 buffer 并同时执行 XOR 掩码操作
 	payloadStart := len(buf)
-	buf = append(buf, payload...)
-
+	buf = append(buf, b...)
+	
 	for i := 0; i < length; i++ {
 		buf[payloadStart+i] ^= maskKey[i%4]
 	}
@@ -188,101 +151,53 @@ func (w *WSConn) writeFrame(opcode byte, payload []byte) (int, error) {
 	return length, nil
 }
 
-func (w *WSConn) Write(b []byte) (int, error) {
-	// 0x2 = Binary Frame
-	return w.writeFrame(0x02, b)
-}
-
 func (w *WSConn) Read(b []byte) (int, error) {
 	for {
-		// 如果当前帧还有剩余数据，直接读取
+		// 1. 如果當前幀還有數據，直接讀取
 		if w.remaining > 0 {
 			limit := int64(len(b))
-			if w.remaining < limit {
-				limit = w.remaining
-			}
+			if w.remaining < limit { limit = w.remaining }
 			n, err := w.reader.Read(b[:limit])
-			if n > 0 {
-				w.remaining -= int64(n)
-			}
-			return n, err
+			if n > 0 { w.remaining -= int64(n) }
+			if n > 0 || err != nil { return n, err }
 		}
 
-		// 读取新帧头部
+		// 2. 讀取新幀
 		header, err := w.reader.ReadByte()
-		if err != nil {
-			return 0, err
-		}
-
-		// 解析 FIN, Opcode (忽略 RSV1-3，假设无压缩)
-		// fin := (header & 0x80) != 0
+		if err != nil { return 0, err }
+		
 		opcode := header & 0x0F
-
 		lenByte, err := w.reader.ReadByte()
-		if err != nil {
-			return 0, err
-		}
+		if err != nil { return 0, err }
 
 		masked := (lenByte & 0x80) != 0
 		payloadLen := int64(lenByte & 0x7F)
 
 		if payloadLen == 126 {
 			lenBuf := make([]byte, 2)
-			if _, err := io.ReadFull(w.reader, lenBuf); err != nil {
-				return 0, err
-			}
+			if _, err := io.ReadFull(w.reader, lenBuf); err != nil { return 0, err }
 			payloadLen = int64(binary.BigEndian.Uint16(lenBuf))
 		} else if payloadLen == 127 {
 			lenBuf := make([]byte, 8)
-			if _, err := io.ReadFull(w.reader, lenBuf); err != nil {
-				return 0, err
-			}
+			if _, err := io.ReadFull(w.reader, lenBuf); err != nil { return 0, err }
 			payloadLen = int64(binary.BigEndian.Uint64(lenBuf))
 		}
 
-		// 如果有 Mask (服务器发给客户端通常没有，但为了健壮性处理)
 		if masked {
-			maskKey := make([]byte, 4)
-			if _, err := io.ReadFull(w.reader, maskKey); err != nil {
-				return 0, err
-			}
-			// 这里我们为了性能简化处理：如果服务器发了 Mask，我们只丢弃 Key，
-			// 不做解码（因为标准中 Server -> Client 不应 Mask）。
-			// 如果确实遇到了 Masked Response，数据会乱码，但在代理场景极少见。
+			if _, err := io.CopyN(io.Discard, w.reader, 4); err != nil { return 0, err }
 		}
 
+		// 處理控制幀
 		switch opcode {
-		case 0x8: // Close Frame
-			return 0, io.EOF
-		case 0x9: // Ping Frame
-			// 读取 Ping Payload
-			pingPayload := make([]byte, payloadLen)
-			if payloadLen > 0 {
-				if _, err := io.ReadFull(w.reader, pingPayload); err != nil {
-					return 0, err
-				}
-			}
-			// 立即回复 Pong
-			if _, err := w.writeFrame(0x0A, pingPayload); err != nil {
-				return 0, err
-			}
+		case 0x8: return 0, io.EOF
+		case 0x9, 0xA:
+			if payloadLen > 0 { io.CopyN(io.Discard, w.reader, payloadLen) }
 			continue
-		case 0xA: // Pong Frame
-			if payloadLen > 0 {
-				io.CopyN(io.Discard, w.reader, payloadLen)
-			}
-			continue
-		case 0x0, 0x1, 0x2: // Data Frames (Continuation, Text, Binary)
+		case 0x0, 0x1, 0x2:
 			w.remaining = payloadLen
-			if w.remaining == 0 {
-				continue
-			}
-			// 回到循环顶部去读取实际数据
+			if w.remaining == 0 { continue }
 		default:
-			// 未知帧，丢弃 Payload
-			if payloadLen > 0 {
-				io.CopyN(io.Discard, w.reader, payloadLen)
-			}
+			if payloadLen > 0 { io.CopyN(io.Discard, w.reader, payloadLen) }
 			continue
 		}
 	}
