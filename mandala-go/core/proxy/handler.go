@@ -22,8 +22,10 @@ type Handler struct {
 func (h *Handler) HandleConnection(localConn net.Conn) {
 	defer localConn.Close()
 
-	// 1. SOCKS5 握手阶段 (本地 App -> 本地核心)
-	// 读取 [VER, NMETHODS]
+	// 1. 本地 SOCKS5 握手 (App -> 本地核心)
+	// 设置 5 秒超时，确保本地通信不卡死
+	localConn.SetDeadline(time.Now().Add(5 * time.Second))
+	
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(localConn, header); err != nil {
 		return
@@ -32,117 +34,93 @@ func (h *Handler) HandleConnection(localConn net.Conn) {
 		return
 	}
 
-	// [关键修复] 必须消费掉客户端发送的所有 METHODS 列表
-	// 如果不读取这部分，后续读取 Request 时会发生字节偏移，导致断流
+	// [关键修复] 必须消费掉所有方法列表，防止位元组残留在缓冲区
 	nMethods := int(header[1])
 	methods := make([]byte, nMethods)
 	if _, err := io.ReadFull(localConn, methods); err != nil {
 		return
 	}
 
-	// 告知本地客户端：无需认证 (0x00)
-	// 注意：此处是本地握手，App 到核心之间通常不设密码
+	// 回复无需认证
 	if _, err := localConn.Write([]byte{0x05, 0x00}); err != nil {
 		return
 	}
 
-	// 2. 读取客户端连接请求 (Request)
-	// 格式: [VER, CMD, RSV, ATYP]
+	// 2. 读取客户端连接请求
 	requestHead := make([]byte, 4)
 	if _, err := io.ReadFull(localConn, requestHead); err != nil {
 		return
 	}
 
-	cmd := requestHead[1]
-	atyp := requestHead[3]
-
-	if cmd != 0x01 { // 仅支持 CONNECT 命令
+	if requestHead[1] != 0x01 { // 仅支持 CONNECT
 		return
 	}
 
 	var targetHost string
 	var targetPort int
+	atyp := requestHead[3]
 
-	// 解析目标地址
+	// 解析地址
 	switch atyp {
 	case 0x01: // IPv4
-		ipBuf := make([]byte, 4)
-		if _, err := io.ReadFull(localConn, ipBuf); err != nil {
-			return
-		}
-		targetHost = net.IP(ipBuf).String()
+		ip := make([]byte, 4)
+		io.ReadFull(localConn, ip)
+		targetHost = net.IP(ip).String()
 	case 0x03: // Domain
 		lenBuf := make([]byte, 1)
-		if _, err := io.ReadFull(localConn, lenBuf); err != nil {
-			return
-		}
-		domainLen := int(lenBuf[0])
-		domainBuf := make([]byte, domainLen)
-		if _, err := io.ReadFull(localConn, domainBuf); err != nil {
-			return
-		}
-		targetHost = string(domainBuf)
+		io.ReadFull(localConn, lenBuf)
+		domain := make([]byte, int(lenBuf[0]))
+		io.ReadFull(localConn, domain)
+		targetHost = string(domain)
 	case 0x04: // IPv6
-		ipBuf := make([]byte, 16)
-		if _, err := io.ReadFull(localConn, ipBuf); err != nil {
-			return
-		}
-		targetHost = net.IP(ipBuf).String()
+		ip := make([]byte, 16)
+		io.ReadFull(localConn, ip)
+		targetHost = net.IP(ip).String()
 	default:
 		return
 	}
 
-	// 读取端口 (2 bytes)
 	portBuf := make([]byte, 2)
-	if _, err := io.ReadFull(localConn, portBuf); err != nil {
-		return
-	}
+	io.ReadFull(localConn, portBuf)
 	targetPort = int(portBuf[0])<<8 | int(portBuf[1])
 
-	// 3. 连接远程代理服务器 (本地核心 -> 远程服务端)
+	// 3. 连接远程代理服务器 (WebSocket)
 	dialer := NewDialer(h.Config)
 	remoteConn, err := dialer.Dial()
 	if err != nil {
-		log.Printf("[Proxy] 连接远程服务器失败: %v", err)
-		// 告知本地客户端：连接失败 (0x04 Host unreachable)
+		log.Printf("[Proxy] 连接远程失败: %v", err)
 		localConn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
 	defer remoteConn.Close()
 
 	// 4. 执行远程协议握手
+	// [优化] 针对 Cloudflare Worker 的延迟，远程握手超时设为 15 秒
+	remoteConn.SetDeadline(time.Now().Add(15 * time.Second))
+	
 	proxyType := strings.ToLower(h.Config.Type)
 	isVless := false
 
 	switch proxyType {
 	case "mandala":
 		client := protocol.NewMandalaClient(h.Config.Username, h.Config.Password)
-		payload, err := client.BuildHandshakePayload(targetHost, targetPort)
-		if err == nil {
-			remoteConn.Write(payload)
-		}
+		payload, _ := client.BuildHandshakePayload(targetHost, targetPort)
+		remoteConn.Write(payload)
 
 	case "trojan":
-		payload, err := protocol.BuildTrojanPayload(h.Config.Password, targetHost, targetPort)
-		if err == nil {
-			remoteConn.Write(payload)
-		}
+		payload, _ := protocol.BuildTrojanPayload(h.Config.Password, targetHost, targetPort)
+		remoteConn.Write(payload)
 
 	case "vless":
-		payload, err := protocol.BuildVlessPayload(h.Config.UUID, targetHost, targetPort)
-		if err == nil {
-			remoteConn.Write(payload)
-		}
+		payload, _ := protocol.BuildVlessPayload(h.Config.UUID, targetHost, targetPort)
+		remoteConn.Write(payload)
 		isVless = true
 
 	case "shadowsocks":
-		payload, err := protocol.BuildShadowsocksPayload(targetHost, targetPort)
-		if err == nil {
-			remoteConn.Write(payload)
-		}
+		payload, _ := protocol.BuildShadowsocksPayload(targetHost, targetPort)
+		remoteConn.Write(payload)
 
 	case "socks", "socks5":
-		// 执行包含用户名密码认证的 SOCKS5 握手
 		err := protocol.HandshakeSocks5(remoteConn, h.Config.Username, h.Config.Password, targetHost, targetPort)
 		if err != nil {
 			log.Printf("[Socks5] 远程握手失败: %v", err)
@@ -150,17 +128,14 @@ func (h *Handler) HandleConnection(localConn net.Conn) {
 		}
 	}
 
-	// 如果是 VLESS，包装连接以剥离响应头
 	if isVless {
 		remoteConn = protocol.NewVlessConn(remoteConn)
 	}
 
-	// 5. 告知本地客户端连接成功 (标准 10 字节响应)
-	if _, err := localConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
-		return
-	}
+	// 5. 握手成功，告知本地 App
+	localConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
-	// 6. 双向转发流量
+	// 6. 清除超时，进入双向转发
 	localConn.SetDeadline(time.Time{})
 	remoteConn.SetDeadline(time.Time{})
 
