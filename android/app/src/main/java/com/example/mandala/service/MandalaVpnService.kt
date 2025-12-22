@@ -22,6 +22,9 @@ class MandalaVpnService : VpnService() {
         private const val VPN_ADDRESS = "172.16.0.1"
         private const val CHANNEL_ID = "MandalaChannel"
         private const val NOTIFICATION_ID = 1
+        
+        // [修复] 设置 MTU 为 1280 以避免 SOCKS5 封装后的包被运营商丢弃
+        private const val VPN_MTU = 1280
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
@@ -83,7 +86,8 @@ class MandalaVpnService : VpnService() {
                 .addAddress(VPN_ADDRESS, 24)
                 .addRoute("0.0.0.0", 0)
                 .addRoute("::", 0)
-                .setMtu(1500)
+                // [修复] 关键修改：设置 MTU 为 1280
+                .setMtu(VPN_MTU)
                 .addDnsServer("8.8.8.8")
                 .addDisallowedApplication(packageName)
                 .setSession("Mandala Core")
@@ -93,7 +97,8 @@ class MandalaVpnService : VpnService() {
                 val manager = getSystemService(NotificationManager::class.java)
                 manager.notify(NOTIFICATION_ID, createNotification("VPN 已连接"))
 
-                val err = Mobile.startVpn(it.fd.toLong(), 1500L, configJson)
+                // [修复] 将 1280 作为 MTU 参数传递给 Go 核心
+                val err = Mobile.startVpn(it.fd.toLong(), VPN_MTU.toLong(), configJson)
                 if (err.isNotEmpty()) {
                     stopVpn()
                 }
