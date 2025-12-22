@@ -41,7 +41,6 @@ type Stack struct {
 }
 
 func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
-	// [调试] 打印传入的 MTU，如果这里显示 1500，则说明 Android 端未正确设置
 	log.Printf("[Stack] 启动中 (FD: %d, MTU: %d, Type: %s)", fd, mtu, cfg.Type)
 
 	dev, err := NewDevice(fd, uint32(mtu))
@@ -49,7 +48,6 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 		return nil, err
 	}
 
-	// 1. 创建协议栈
 	s := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
 			ipv4.NewProtocol,
@@ -61,10 +59,6 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 		},
 	})
 
-	// 注意：移除了旧版 gVisor 不支持的 SACK/BufferSize 选项
-	// 性能优化主要依赖下方的 startPacketHandling
-
-	// 2. 配置网卡
 	s.SetForwardingDefaultAndAllNICs(ipv4.ProtocolNumber, true)
 	s.SetForwardingDefaultAndAllNICs(ipv6.ProtocolNumber, true)
 
@@ -100,10 +94,12 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 }
 
 func (s *Stack) startPacketHandling() {
-	// [关键优化]
-	// rcvWnd: 1MB (接收窗口)。解决断流问题。
-	// maxInFlight: 2048 (最大并发)。解决网页并发连接丢失。
-	rcvWnd := 1 << 20
+	// [关键修复]
+	// 原来的 30000 太小，导致接收一点数据后窗口填满，停止接收。
+	// 修改为 1MB (1<<20) 以支持连续数据传输。
+	// 原来的 10 太小，导致网页并发连接被丢弃。
+	// 修改为 2048。
+	rcvWnd := 1 << 20 
 	maxInFlight := 2048
 
 	tcpHandler := tcp.NewForwarder(s.stack, rcvWnd, maxInFlight, func(r *tcp.ForwarderRequest) {
@@ -126,7 +122,6 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 
 	id := r.ID()
 
-	// 1. 拨号代理
 	remoteConn, dialErr := s.dialer.Dial()
 	if dialErr != nil {
 		r.Complete(true)
@@ -134,7 +129,6 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	}
 	defer remoteConn.Close()
 
-	// 2. 握手
 	var payload []byte
 	var hErr error
 	targetHost := id.LocalAddress.String()
@@ -153,7 +147,6 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	case "shadowsocks":
 		payload, hErr = protocol.BuildShadowsocksPayload(targetHost, targetPort)
 	case "socks", "socks5":
-		// 注意：请确保您已应用之前提供的 socks5.go 修复 (严格无缓冲读取)
 		hErr = protocol.HandshakeSocks5(remoteConn, s.config.Username, s.config.Password, targetHost, targetPort)
 	}
 
@@ -173,7 +166,6 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 		remoteConn = protocol.NewVlessConn(remoteConn)
 	}
 
-	// 3. 建立本地连接
 	var wq waiter.Queue
 	ep, err := r.CreateEndpoint(&wq)
 	if err != nil {
@@ -185,15 +177,16 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	localConn := gonet.NewTCPConn(&wq, ep)
 	defer localConn.Close()
 
-	// 4. 双向转发
+	// 双向转发
 	go func() {
-		io.Copy(remoteConn, localConn)
-		// 远程写入关闭通常不需要特别处理，依赖 defer Close
+		// 上行: App -> Remote
+		io.Copy(localConn, remoteConn)
+		localConn.CloseWrite()
 	}()
 
-	io.Copy(localConn, remoteConn)
-	// 本地连接写入端关闭
-	localConn.CloseWrite()
+	// 下行: Remote -> App
+	// 如果这里断流，通常是 localConn 写缓冲区满了 (因为 rcvWnd 太小)
+	io.Copy(remoteConn, localConn)
 }
 
 func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
@@ -256,7 +249,6 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 
 	proxyConn, err := s.dialer.Dial()
 	if err != nil {
-		log.Printf("[DNS] 代理连接失败: %v", err)
 		return
 	}
 	defer proxyConn.Close()
@@ -277,7 +269,6 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 		payload, _ = protocol.BuildShadowsocksPayload("8.8.8.8", 53)
 	case "socks", "socks5":
 		if err := protocol.HandshakeSocks5(proxyConn, s.config.Username, s.config.Password, "8.8.8.8", 53); err != nil {
-			log.Printf("[DNS] Socks5握手失败: %v", err)
 			return
 		}
 	}
@@ -318,17 +309,9 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 
 func (s *Stack) Close() {
 	s.closeOnce.Do(func() {
-		log.Println("[Stack] Stopping...")
-		if s.cancel != nil {
-			s.cancel()
-		}
+		if s.cancel != nil { s.cancel() }
 		time.Sleep(100 * time.Millisecond)
-		if s.device != nil {
-			s.device.Close()
-		}
-		if s.stack != nil {
-			s.stack.Close()
-		}
-		log.Println("[Stack] Stopped.")
+		if s.device != nil { s.device.Close() }
+		if s.stack != nil { s.stack.Close() }
 	})
 }
