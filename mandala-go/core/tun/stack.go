@@ -7,7 +7,7 @@ import (
 	"log"
 	"net"
 	"strings"
-	"sync" // [新增] 引入 sync 包
+	"sync"
 	"time"
 
 	"mandala/core/config"
@@ -94,8 +94,8 @@ func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
 }
 
 func (s *Stack) startPacketHandling() {
-	// 窗口大小设置为 1MB，飞行数据包设置为 2048，确保高吞吐量
-	rcvWnd := 1 << 20
+	// [修复] 将接收窗口设为 0 (默认)，让 gVisor 自动调整，避免手动设置太小或太大导致问题
+	rcvWnd := 0 
 	maxInFlight := 2048
 
 	tcpHandler := tcp.NewForwarder(s.stack, rcvWnd, maxInFlight, func(r *tcp.ForwarderRequest) {
@@ -173,8 +173,6 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	localConn := gonet.NewTCPConn(&wq, ep)
 	defer localConn.Close()
 
-	// [关键修复] 使用 WaitGroup 确保双向转发都完成后再关闭连接
-	// 避免主线程因为“上传完成”就立即退出并关闭 RemoteConn，导致“下载”被中断。
 	var wg sync.WaitGroup
 	wg.Add(1)
 
@@ -182,20 +180,16 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	go func() {
 		defer wg.Done()
 		io.Copy(localConn, remoteConn)
-		// 告诉 App 端数据发完了（半关闭），但通常 LocalConn (gVisor) 会自己处理 FIN
 		localConn.CloseWrite()
 	}()
 
 	// 上传流: App -> Remote
 	io.Copy(remoteConn, localConn)
 
-	// [修复] 上传完成后，尝试对远程连接执行半关闭（发送 TCP FIN）。
-	// 这告诉服务器：“我的请求发完了，请发响应给我”，而不是直接发 RST。
 	if cw, ok := remoteConn.(interface{ CloseWrite() error }); ok {
 		cw.CloseWrite()
 	}
 
-	// 等待下载流结束
 	wg.Wait()
 }
 
