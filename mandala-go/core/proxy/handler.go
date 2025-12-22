@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync" // [修复] 引入 sync 包以支持等待组
 	"time"
 
 	"mandala/core/config"
@@ -52,16 +53,14 @@ func (h *Handler) HandleConnection(localConn net.Conn) {
 	}
 }
 
-// handleSocks5 处理 SOCKS5 协议 (逻辑与 C 版本对齐，修复了数据流丢失问题)
+// handleSocks5 处理 SOCKS5 协议
 func (h *Handler) handleSocks5(localConn net.Conn, reader *bufio.Reader) {
 	// 1. 握手阶段：协商认证方法
-	// 读取版本号和方法数量
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(reader, header); err != nil {
 		return
 	}
 
-	// 读取方法列表并忽略（目前仅支持无需认证）
 	nMethods := int(header[1])
 	methods := make([]byte, nMethods)
 	if _, err := io.ReadFull(reader, methods); err != nil {
@@ -74,7 +73,6 @@ func (h *Handler) handleSocks5(localConn net.Conn, reader *bufio.Reader) {
 	}
 
 	// 2. 请求阶段：读取 SOCKS5 CONNECT 请求
-	// 读取前 4 字节: [VER, CMD, RSV, ATYP]
 	requestHead := make([]byte, 4)
 	if _, err := io.ReadFull(reader, requestHead); err != nil {
 		return
@@ -117,10 +115,8 @@ func (h *Handler) handleSocks5(localConn net.Conn, reader *bufio.Reader) {
 	targetPort = int(portBuf[0])<<8 | int(portBuf[1])
 
 	// 3. 建立远程连接
-	// 使用统一的 dialRemote 逻辑连接到服务器节点并完成协议握手
 	remoteConn, err := h.dialRemote(targetHost, targetPort)
 	if err != nil {
-		// 通知本地客户端连接失败 (0x05 0x04: 主机不可达)
 		localConn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		log.Printf("[SOCKS5] 连接远程失败: %v", err)
 		return
@@ -131,20 +127,17 @@ func (h *Handler) handleSocks5(localConn net.Conn, reader *bufio.Reader) {
 	localConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
 	// 4. 双向转发
-	// 关键修复：从 reader 转发数据到 remote，确保不会丢失缓冲区内已读取的数据
 	h.forward(localConn, reader, remoteConn)
 }
-// handleHttp 处理 HTTP 代理请求 (包括 HTTPS CONNECT 和普通 HTTP 请求)
+
+// handleHttp 处理 HTTP 代理请求
 func (h *Handler) handleHttp(localConn net.Conn, reader *bufio.Reader) {
-	// 1. 使用 http.ReadRequest 从具有缓冲的 reader 中解析请求
-	// 这确保了即使部分数据已被读取到缓冲区，解析依然正确
 	req, err := http.ReadRequest(reader)
 	if err != nil {
 		log.Printf("[HTTP] 解析请求失败: %v", err)
 		return
 	}
 
-	// 2. 提取目标主机和端口
 	targetHost := req.URL.Hostname()
 	targetPort := 80
 	if portStr := req.URL.Port(); portStr != "" {
@@ -156,7 +149,6 @@ func (h *Handler) handleHttp(localConn net.Conn, reader *bufio.Reader) {
 		targetPort = 443
 	}
 
-	// 如果 URL 中未指定 Host，则从 Header 中提取
 	if targetHost == "" && req.Host != "" {
 		hostParts := strings.Split(req.Host, ":")
 		targetHost = hostParts[0]
@@ -172,7 +164,6 @@ func (h *Handler) handleHttp(localConn net.Conn, reader *bufio.Reader) {
 		return
 	}
 
-	// 3. 连接远程节点
 	remoteConn, err := h.dialRemote(targetHost, targetPort)
 	if err != nil {
 		log.Printf("[HTTP] 连接远程失败: %s:%d %v", targetHost, targetPort, err)
@@ -180,16 +171,12 @@ func (h *Handler) handleHttp(localConn net.Conn, reader *bufio.Reader) {
 	}
 	defer remoteConn.Close()
 
-	// 4. 根据请求方法处理后续逻辑
 	if req.Method == http.MethodConnect {
-		// HTTPS 隧道：回复客户端 200 OK
 		if _, err := localConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 			return
 		}
-		// 开始双向转发
 		h.forward(localConn, reader, remoteConn)
 	} else {
-		// 普通 HTTP 请求：需要将已解析并从缓冲区读出的请求重新发送给远程节点
 		var buf bytes.Buffer
 		if err := req.Write(&buf); err != nil {
 			return
@@ -197,7 +184,6 @@ func (h *Handler) handleHttp(localConn net.Conn, reader *bufio.Reader) {
 		if _, err := remoteConn.Write(buf.Bytes()); err != nil {
 			return
 		}
-		// 继续转发后续的 Body 或其他流数据
 		h.forward(localConn, reader, remoteConn)
 	}
 }
@@ -210,14 +196,12 @@ func (h *Handler) dialRemote(host string, port int) (net.Conn, error) {
 		return nil, err
 	}
 
-	// 设置握手超时时间，防止连接卡死
 	remoteConn.SetDeadline(time.Now().Add(15 * time.Second))
 	
 	proxyType := strings.ToLower(h.Config.Type)
 	var finalConn net.Conn = remoteConn
 	var handshakeErr error
 
-	// 执行对应的远程协议握手
 	switch proxyType {
 	case "mandala":
 		client := protocol.NewMandalaClient(h.Config.Username, h.Config.Password)
@@ -231,7 +215,6 @@ func (h *Handler) dialRemote(host string, port int) (net.Conn, error) {
 	case "vless":
 		payload, _ := protocol.BuildVlessPayload(h.Config.UUID, host, port)
 		if _, handshakeErr = remoteConn.Write(payload); handshakeErr == nil {
-			// VLESS 响应头剥离由 VlessConn 处理
 			finalConn = protocol.NewVlessConn(remoteConn)
 		}
 
@@ -248,32 +231,37 @@ func (h *Handler) dialRemote(host string, port int) (net.Conn, error) {
 		return nil, handshakeErr
 	}
 
-	// 握手成功，清除超时设置
 	remoteConn.SetDeadline(time.Time{})
 	return finalConn, nil
 }
 
 // forward 实现高效的双向数据转发
-// 注意：localReader 必须是 HandleConnection 中创建的 bufio.Reader，以防数据丢失
+// 修复：使用 sync.WaitGroup 确保上传流和下载流都完成后再关闭连接，解决 SOCKS5 接收数据不完整的问题
 func (h *Handler) forward(local net.Conn, localReader *bufio.Reader, remote net.Conn) {
-	errChan := make(chan error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	// 协程1: 本地 -> 远程 (从具有缓冲区的 localReader 读取)
+	// 协程1: 本地 -> 远程 (上传流)
 	go func() {
-		_, err := io.Copy(remote, localReader)
-		errChan <- err
-		remote.Close()
-		local.Close()
+		defer wg.Done()
+		// 从具有缓冲区的 localReader 读取，确保不丢失协议探测阶段已读取的数据
+		io.Copy(remote, localReader)
+		// 发送完毕后尝试半关闭远程连接的写入端，告知服务器请求结束
+		if cw, ok := remote.(interface{ CloseWrite() error }); ok {
+			cw.CloseWrite()
+		}
 	}()
 
-	// 协程2: 远程 -> 本地
+	// 协程2: 远程 -> 本地 (下载流)
 	go func() {
-		_, err := io.Copy(local, remote)
-		errChan <- err
-		local.Close()
-		remote.Close()
+		defer wg.Done()
+		io.Copy(local, remote)
+		// 接收完毕后尝试半关闭本地连接的写入端
+		if cw, ok := local.(interface{ CloseWrite() error }); ok {
+			cw.CloseWrite()
+		}
 	}()
 
-	// 等待任一方向结束
-	<-errChan
+	// 关键修复：等待两个方向的传输全部结束
+	wg.Wait()
 }
