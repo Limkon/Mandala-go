@@ -1,4 +1,4 @@
-// 文件路徑: android/app/src/main/java/com/example/mandala/viewmodel/MainViewModel.kt
+// 文件路径: android/app/src/main/java/com/example/mandala/viewmodel/MainViewModel.kt
 
 package com.example.mandala.viewmodel
 
@@ -14,7 +14,7 @@ import kotlinx.coroutines.launch
 import mobile.Mobile
 import java.io.File
 
-// --- 數據模型定義 ---
+// --- 数据模型定义 ---
 
 data class AppStrings(
     val home: String, val profiles: String, val settings: String,
@@ -38,24 +38,24 @@ data class AppStrings(
 )
 
 val ChineseStrings = AppStrings(
-    home = "首頁", profiles = "節點", settings = "設置",
-    connect = "連接", disconnect = "斷開",
-    connected = "已連接", notConnected = "未連接",
-    noNodeSelected = "請先選擇一個節點",
-    nodeManagement = "節點管理", importFromClipboard = "從剪貼板導入", clipboardEmpty = "剪貼板為空",
-    connectionSettings = "連接設置",
-    vpnMode = "VPN 模式", vpnModeDesc = "通過 Mandala 路由所有設備流量",
-    allowInsecure = "允許不安全連接", allowInsecureDesc = "跳過 TLS 證書驗證 (危險)",
-    protocolSettings = "協議參數 (核心)",
-    tlsFragment = "TLS 分片", tlsFragmentDesc = "拆分 TLS 記錄以繞過 DPI 檢測",
-    randomPadding = "隨機填充", randomPaddingDesc = "向數據包添加隨機噪音",
-    localPort = "本地監聽端口",
-    appSettings = "應用設置", theme = "主題", language = "語言",
-    about = "關於", confirm = "確定", cancel = "取消",
-    edit = "編輯", delete = "刪除", save = "保存",
-    deleteConfirm = "確定要刪除此節點嗎？",
-    tag = "備註", address = "地址", port = "端口",
-    password = "密碼", uuid = "UUID", sni = "SNI (域名)"
+    home = "首页", profiles = "节点", settings = "设置",
+    connect = "连接", disconnect = "断开",
+    connected = "已连接", notConnected = "未连接",
+    noNodeSelected = "请先选择一个节点",
+    nodeManagement = "节点管理", importFromClipboard = "从剪贴板导入", clipboardEmpty = "剪贴板为空",
+    connectionSettings = "连接设置",
+    vpnMode = "VPN 模式", vpnModeDesc = "通过 Mandala 路由所有设备流量",
+    allowInsecure = "允许不安全连接", allowInsecureDesc = "跳过 TLS 证书验证 (危险)",
+    protocolSettings = "协议参数 (核心)",
+    tlsFragment = "TLS 分片", tlsFragmentDesc = "拆分 TLS 记录以绕过 DPI 检测",
+    randomPadding = "随机填充", randomPaddingDesc = "向数据包添加随机噪音",
+    localPort = "本地监听端口",
+    appSettings = "应用设置", theme = "主题", language = "语言",
+    about = "关于", confirm = "确定", cancel = "取消",
+    edit = "编辑", delete = "删除", save = "保存",
+    deleteConfirm = "确定要删除此节点吗？",
+    tag = "备注", address = "地址", port = "端口",
+    password = "密码", uuid = "UUID", sni = "SNI (域名)"
 )
 
 val EnglishStrings = AppStrings(
@@ -95,7 +95,7 @@ data class Node(
 enum class AppThemeMode { SYSTEM, LIGHT, DARK }
 enum class AppLanguage { CHINESE, ENGLISH }
 
-// --- ViewModel 實現 ---
+// --- ViewModel 实现 ---
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = NodeRepository(application)
@@ -104,13 +104,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _isConnected = MutableStateFlow(false)
     val isConnected = _isConnected.asStateFlow()
 
-    private val _logs = MutableStateFlow(listOf("[系統] 準備就緒"))
+    private val _logs = MutableStateFlow(listOf("[系统] 准备就绪"))
     val logs = _logs.asStateFlow()
 
     private val _nodes = MutableStateFlow<List<Node>>(emptyList())
     val nodes = _nodes.asStateFlow()
 
-    private val _currentNode = MutableStateFlow(Node("未選擇", "none", "0.0.0.0", 0))
+    private val _currentNode = MutableStateFlow(Node("未选择", "none", "0.0.0.0", 0))
     val currentNode = _currentNode.asStateFlow()
 
     private val _vpnMode = MutableStateFlow(prefs.getBoolean("vpn_mode", true))
@@ -154,7 +154,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _isConnected.value = Mobile.isRunning()
     }
 
-    // --- 設置更新 ---
+    // --- 设置更新 ---
 
     fun updateSetting(key: String, value: Boolean) {
         prefs.edit().putBoolean(key, value).apply()
@@ -184,7 +184,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _language.value = lang
     }
 
-    // --- 節點管理與連接 ---
+    // --- 节点管理与连接 ---
 
     fun refreshNodes() {
         viewModelScope.launch {
@@ -205,14 +205,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             if (_isConnected.value) {
                 _vpnEventChannel.send(VpnEvent.StopVpn)
-                addLog("[系統] 正在斷開...")
+                addLog("[系统] 正在断开...")
             } else {
                 if (_currentNode.value.protocol != "none") {
                     val json = generateConfigJson(_currentNode.value)
                     _vpnEventChannel.send(VpnEvent.StartVpn(json))
-                    addLog("[系統] 正在連接: ${_currentNode.value.tag}")
+                    addLog("[系统] 正在连接: ${_currentNode.value.tag}")
                 } else {
-                    addLog("[錯誤] ${appStrings.value.noNodeSelected}")
+                    addLog("[错误] ${appStrings.value.noNodeSelected}")
                 }
             }
         }
@@ -221,7 +221,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun selectNode(node: Node) {
         val updatedNode = node.copy(isSelected = true)
         _currentNode.value = updatedNode
-        addLog("[系統] 已選擇: ${node.tag}")
+        addLog("[系统] 已选择: ${node.tag}")
 
         viewModelScope.launch {
             val currentList = _nodes.value.map { 
@@ -250,7 +250,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _currentNode.value = nodeToSave
             }
             
-            addLog("[系統] 已添加: ${node.tag}")
+            addLog("[系统] 已添加: ${node.tag}")
         }
     }
 
@@ -270,13 +270,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                      _nodes.value = updatedList
                      repository.saveNodes(updatedList)
                  } else {
-                     _currentNode.value = Node("未選擇", "none", "0.0.0.0", 0)
+                     _currentNode.value = Node("未选择", "none", "0.0.0.0", 0)
                      _nodes.value = emptyList()
                  }
             } else {
                 _nodes.value = currentList
             }
-            addLog("[系統] 已刪除: ${node.tag}")
+            addLog("[系统] 已删除: ${node.tag}")
         }
     }
 
@@ -296,19 +296,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 
                 _nodes.value = currentList
-                addLog("[系統] 已更新: ${newNode.tag}")
+                addLog("[系统] 已更新: ${newNode.tag}")
             }
         }
     }
 
     fun onVpnStarted() {
         _isConnected.value = true
-        addLog("[核心] 已連通網絡")
+        addLog("[核心] 已连通网络")
     }
 
     fun onVpnStopped() {
         _isConnected.value = false
-        addLog("[核心] 連接已關閉")
+        addLog("[核心] 连接已关闭")
     }
 
     fun importFromText(text: String, onResult: (Boolean, String) -> Unit) {
@@ -335,15 +335,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 if (addedCount > 0) {
                     repository.saveNodes(current)
                     refreshNodes()
-                    val msg = "成功導入 $addedCount 個節點" + if (newNodes.size > addedCount) " (過濾 ${newNodes.size - addedCount} 個重複)" else ""
-                    addLog("[系統] $msg")
+                    val msg = "成功导入 $addedCount 个节点" + if (newNodes.size > addedCount) " (过滤 ${newNodes.size - addedCount} 个重复)" else ""
+                    addLog("[系统] $msg")
                     onResult(true, msg)
                 } else {
-                    onResult(false, "節點已存在，未導入新節點")
+                    onResult(false, "节点已存在，未导入新节点")
                 }
             }
         } else {
-            onResult(false, "未識別到有效的節點鏈接")
+            onResult(false, "未识别到有效的节点链接")
         }
     }
 
@@ -355,8 +355,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun generateConfigJson(node: Node): String {
-        // [關鍵修復] 移除了對 Shadowsocks 和 Socks5 的 TLS 硬屏蔽
-        // 只要節點配置了傳輸方式（如 ws）或 SNI，就應該允許啟用 TLS 以符合大多數服務端配置
+        // [关键修复] 移除了对 Shadowsocks 和 Socks5 的 TLS 硬屏蔽
+        // 只要节点配置了 SNI、使用了 WebSocket 传输或者使用了 443 端口，就应当允许启用 TLS
         val useTls = node.sni.isNotEmpty() || node.transport == "ws" || node.port == 443
 
         val logDir = getApplication<Application>().getExternalFilesDir(null)
