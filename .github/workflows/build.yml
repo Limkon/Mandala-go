@@ -28,7 +28,7 @@ jobs:
             ~/go/bin/gomobile
             ~/go/bin/gobind
             ~/go/pkg/gomobile
-          key: ${{ runner.os }}-gomobile-v2  # 建议每次改 target 时更新版本号 v1 -> v2
+          key: ${{ runner.os }}-gomobile-v2
 
       # 安装 Gomobile 工具链 (仅在缓存未命中时执行)
       - name: Install Gomobile Toolchain
@@ -55,7 +55,7 @@ jobs:
         run: |
           echo "Building Mandala Core..."
           go mod tidy
-          # 【关键修改】只编译 arm64 和 arm，跳过 x86 和 x86_64
+          # 只编译 arm64 和 arm，跳过 x86 和 x86_64
           gomobile bind -v \
             -target=android/arm64,android/arm \
             -androidapi 21 \
@@ -111,9 +111,14 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleDebug --stacktrace --no-daemon --build-cache
 
+      # 重命名生成的 APK 文件
+      - name: Rename Output APK
+        run: |
+          mv android/app/build/outputs/apk/debug/app-debug.apk android/app/build/outputs/apk/debug/app-Mandala.apk
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Mandala-Android
+          name: Mandala-Android-Debug
           path: android/app/build/outputs/apk/debug/app-Mandala.apk
           retention-days: 7
