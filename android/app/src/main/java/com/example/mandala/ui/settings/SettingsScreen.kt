@@ -1,3 +1,5 @@
+// 文件路径: android/app/src/main/java/com/example/mandala/ui/settings/SettingsScreen.kt
+
 package com.example.mandala.ui.settings
 
 import androidx.compose.foundation.clickable
@@ -29,6 +31,7 @@ fun SettingsScreen(viewModel: MainViewModel) {
     val tlsFragment by viewModel.tlsFragment.collectAsState()
     val randomPadding by viewModel.randomPadding.collectAsState()
     val localPort by viewModel.localPort.collectAsState()
+    val loggingEnabled by viewModel.loggingEnabled.collectAsState() // [新增]
     val themeMode by viewModel.themeMode.collectAsState()
     val language by viewModel.language.collectAsState()
 
@@ -116,6 +119,13 @@ fun SettingsScreen(viewModel: MainViewModel) {
                 subtitle = strings.randomPaddingDesc,
                 checked = randomPadding,
                 onCheckedChange = { viewModel.updateSetting("random_padding", it) }
+            )
+            // [新增] 日志开关
+            SwitchSetting(
+                title = strings.enableLogging,
+                subtitle = strings.enableLoggingDesc,
+                checked = loggingEnabled,
+                onCheckedChange = { viewModel.updateSetting("logging_enabled", it) }
             )
             // 可点击的端口设置
             ClickableSetting(
