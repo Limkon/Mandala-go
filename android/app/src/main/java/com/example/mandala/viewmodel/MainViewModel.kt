@@ -29,6 +29,9 @@ data class AppStrings(
     val tlsFragment: String, val tlsFragmentDesc: String,
     val randomPadding: String, val randomPaddingDesc: String,
     val localPort: String,
+    // [新增] 日志开关相关文字
+    val enableLogging: String,
+    val enableLoggingDesc: String,
     val appSettings: String, val theme: String, val language: String,
     val about: String, val confirm: String, val cancel: String,
     val edit: String, val delete: String, val save: String,
@@ -50,6 +53,9 @@ val ChineseStrings = AppStrings(
     tlsFragment = "TLS 分片", tlsFragmentDesc = "拆分 TLS 记录以绕过 DPI 检测",
     randomPadding = "随机填充", randomPaddingDesc = "向数据包添加随机噪音",
     localPort = "本地监听端口",
+    // [新增]
+    enableLogging = "启用日志记录",
+    enableLoggingDesc = "将核心运行日志保存到本地文件以便调试",
     appSettings = "应用设置", theme = "主题", language = "语言",
     about = "关于", confirm = "确定", cancel = "取消",
     edit = "编辑", delete = "删除", save = "保存",
@@ -71,6 +77,9 @@ val EnglishStrings = AppStrings(
     tlsFragment = "TLS Fragment", tlsFragmentDesc = "Split TLS records to bypass DPI",
     randomPadding = "Random Padding", randomPaddingDesc = "Add random noise to packets",
     localPort = "Local Port",
+    // [新增]
+    enableLogging = "Enable Logging",
+    enableLoggingDesc = "Save core logs to local file for debugging",
     appSettings = "App Settings", theme = "Theme", language = "Language",
     about = "About", confirm = "OK", cancel = "Cancel",
     edit = "Edit", delete = "Delete", save = "Save",
@@ -128,6 +137,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _localPort = MutableStateFlow(prefs.getInt("local_port", 10809))
     val localPort = _localPort.asStateFlow()
 
+    // [新增] 日志开关状态
+    private val _loggingEnabled = MutableStateFlow(prefs.getBoolean("logging_enabled", false))
+    val loggingEnabled = _loggingEnabled.asStateFlow()
+
     private val _themeMode = MutableStateFlow(
         AppThemeMode.values()[prefs.getInt("theme_mode", AppThemeMode.SYSTEM.ordinal)]
     )
@@ -163,6 +176,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             "allow_insecure" -> _allowInsecure.value = value
             "tls_fragment" -> _tlsFragment.value = value
             "random_padding" -> _randomPadding.value = value
+            "logging_enabled" -> _loggingEnabled.value = value // [新增]
         }
     }
 
@@ -355,16 +369,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun generateConfigJson(node: Node): String {
-        // [关键修复] 移除了对 Shadowsocks 和 Socks5 的 TLS 硬屏蔽
-        // 只要节点配置了 SNI、使用了 WebSocket 传输或者使用了 443 端口，就应当允许启用 TLS
         val useTls = node.sni.isNotEmpty() || node.transport == "ws" || node.port == 443
 
-        val logDir = getApplication<Application>().getExternalFilesDir(null)
-        val logFile = if (logDir != null) {
-            File(logDir, "mandala_core.log").absolutePath
-        } else {
-            getApplication<Application>().filesDir.absolutePath + "/mandala_core.log"
-        }
+        // [重构] 根据开关决定是否传递 log_path。关闭时 logPath 为空，Go 核心 initLog 会直接返回，不产生文件。
+        val logPath = if (_loggingEnabled.value) {
+            val logDir = getApplication<Application>().getExternalFilesDir(null)
+            if (logDir != null) File(logDir, "mandala_core.log").absolutePath 
+            else getApplication<Application>().filesDir.absolutePath + "/mandala_core.log"
+        } else ""
 
         return """
         {
@@ -375,7 +387,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             "password": "${node.password}",
             "uuid": "${node.uuid}",
             "username": "${if(node.protocol == "socks5") node.uuid else ""}",
-            "log_path": "$logFile",
+            "log_path": "$logPath",
             "tls": { 
                 "enabled": $useTls, 
                 "server_name": "${if (node.sni.isEmpty()) node.server else node.sni}",
