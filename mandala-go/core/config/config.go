@@ -18,6 +18,9 @@ type OutboundConfig struct {
 	Password string `json:"password,omitempty"` // Mandala/Trojan/Shadowsocks 使用
 	Username string `json:"username,omitempty"` // SOCKS5 使用
 
+	// [新增] 日志配置
+	LogPath string `json:"log_path,omitempty"` // 日志文件保存路径
+
 	// 高级配置
 	TLS       *TLSConfig       `json:"tls,omitempty"`
 	Transport *TransportConfig `json:"transport,omitempty"`
