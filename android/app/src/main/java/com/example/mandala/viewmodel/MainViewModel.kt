@@ -6,13 +6,21 @@ import android.app.Application
 import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.work.*
 import com.example.mandala.data.NodeRepository
 import com.example.mandala.utils.NodeParser
+import com.example.mandala.worker.SubscriptionWorker
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import mobile.Mobile
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.io.File
+import java.util.concurrent.TimeUnit
 
 // --- 数据模型定义 ---
 
@@ -36,7 +44,10 @@ data class AppStrings(
     val edit: String, val delete: String, val save: String,
     val deleteConfirm: String,
     val tag: String, val address: String, val port: String,
-    val password: String, val uuid: String, val sni: String
+    val password: String, val uuid: String, val sni: String,
+    val subscription: String, val addSubscription: String, val subUrl: String,
+    val updateInterval: String, val daily: String, val weekly: String, val custom: String,
+    val updateNow: String, val lastUpdate: String, val neverUpdate: String
 )
 
 val ChineseStrings = AppStrings(
@@ -57,9 +68,12 @@ val ChineseStrings = AppStrings(
     appSettings = "应用设置", theme = "主题", language = "语言",
     about = "关于", confirm = "确定", cancel = "取消",
     edit = "编辑", delete = "删除", save = "保存",
-    deleteConfirm = "确定要删除此节点吗？",
+    deleteConfirm = "确定要删除吗？",
     tag = "备注", address = "地址", port = "端口",
-    password = "密码", uuid = "UUID", sni = "SNI (域名)"
+    password = "密码", uuid = "UUID", sni = "SNI (域名)",
+    subscription = "订阅管理", addSubscription = "添加订阅", subUrl = "订阅地址 (URL)",
+    updateInterval = "更新频率", daily = "每天", weekly = "每周", custom = "自定义天数",
+    updateNow = "立即更新", lastUpdate = "最后更新", neverUpdate = "从未更新"
 )
 
 val EnglishStrings = AppStrings(
@@ -80,9 +94,12 @@ val EnglishStrings = AppStrings(
     appSettings = "App Settings", theme = "Theme", language = "Language",
     about = "About", confirm = "OK", cancel = "Cancel",
     edit = "Edit", delete = "Delete", save = "Save",
-    deleteConfirm = "Are you sure you want to delete this node?",
+    deleteConfirm = "Are you sure you want to delete?",
     tag = "Tag", address = "Address", port = "Port",
-    password = "Password", uuid = "UUID", sni = "SNI"
+    password = "Password", uuid = "UUID", sni = "SNI",
+    subscription = "Subscriptions", addSubscription = "Add Sub", subUrl = "Subscription URL",
+    updateInterval = "Update Interval", daily = "Daily", weekly = "Weekly", custom = "Custom Days",
+    updateNow = "Update Now", lastUpdate = "Last update", neverUpdate = "Never"
 )
 
 data class Node(
@@ -95,7 +112,19 @@ data class Node(
     val transport: String = "tcp",
     val path: String = "/",
     val sni: String = "",
-    val isSelected: Boolean = false
+    val isSelected: Boolean = false,
+    val subscriptionUrl: String? = null // [新增] 标记所属订阅
+)
+
+enum class UpdateInterval { DAILY, WEEKLY, CUSTOM }
+
+data class Subscription(
+    val url: String,
+    val tag: String,
+    val lastUpdated: Long = 0,
+    val interval: UpdateInterval = UpdateInterval.DAILY,
+    val customDays: Int = 1,
+    val isEnabled: Boolean = true
 )
 
 enum class AppThemeMode { SYSTEM, LIGHT, DARK }
@@ -106,6 +135,10 @@ enum class AppLanguage { CHINESE, ENGLISH }
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = NodeRepository(application)
     private val prefs = application.getSharedPreferences("mandala_settings", Context.MODE_PRIVATE)
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .build()
 
     private val _isConnected = MutableStateFlow(false)
     val isConnected = _isConnected.asStateFlow()
@@ -115,6 +148,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _nodes = MutableStateFlow<List<Node>>(emptyList())
     val nodes = _nodes.asStateFlow()
+
+    private val _subscriptions = MutableStateFlow<List<Subscription>>(emptyList())
+    val subscriptions = _subscriptions.asStateFlow()
 
     private val _currentNode = MutableStateFlow(Node("未选择", "none", "0.0.0.0", 0))
     val currentNode = _currentNode.asStateFlow()
@@ -160,10 +196,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         refreshNodes()
+        refreshSubscriptions()
         _isConnected.value = Mobile.isRunning()
     }
 
-    // --- 设置更新 ---
+    // --- 设置与基础数据刷新 ---
 
     fun updateSetting(key: String, value: Boolean) {
         prefs.edit().putBoolean(key, value).apply()
@@ -194,15 +231,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _language.value = lang
     }
 
-    // --- 节点管理与连接 ---
-
     fun refreshNodes() {
         viewModelScope.launch {
             val saved = repository.loadNodes()
             _nodes.value = saved
-            
             val lastSelected = saved.find { it.isSelected }
-            
             if (lastSelected != null) {
                 _currentNode.value = lastSelected
             } else if (saved.isNotEmpty() && _currentNode.value.protocol == "none") {
@@ -210,6 +243,107 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
+
+    fun refreshSubscriptions() {
+        viewModelScope.launch {
+            _subscriptions.value = repository.loadSubscriptions()
+        }
+    }
+
+    // --- 订阅管理 ---
+
+    fun addSubscription(sub: Subscription) {
+        viewModelScope.launch {
+            val current = _subscriptions.value.toMutableList()
+            if (current.none { it.url == sub.url }) {
+                current.add(sub)
+                repository.saveSubscriptions(current)
+                _subscriptions.value = current
+                scheduleSubscriptionUpdate(sub)
+                updateSubscriptionContent(sub)
+            }
+        }
+    }
+
+    fun deleteSubscription(sub: Subscription) {
+        viewModelScope.launch {
+            val current = _subscriptions.value.toMutableList()
+            current.removeAll { it.url == sub.url }
+            repository.saveSubscriptions(current)
+            _subscriptions.value = current
+            
+            // 删除该订阅关联的节点
+            val currentNodes = _nodes.value.toMutableList()
+            currentNodes.removeAll { it.subscriptionUrl == sub.url }
+            repository.saveNodes(currentNodes)
+            _nodes.value = currentNodes
+            
+            // 取消定时任务
+            WorkManager.getInstance(getApplication()).cancelAllWorkByTag(sub.url)
+            addLog("[订阅] 已移除: ${sub.tag}")
+        }
+    }
+
+    fun updateSubscriptionContent(sub: Subscription) {
+        viewModelScope.launch(Dispatchers.IO) {
+            addLog("[订阅] 正在更新: ${sub.tag}...")
+            try {
+                val request = Request.Builder().url(sub.url).build()
+                httpClient.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) {
+                        val body = response.body?.string() ?: ""
+                        val newNodes = NodeParser.parseList(body).map { 
+                            it.copy(subscriptionUrl = sub.url) 
+                        }
+                        
+                        withContext(Dispatchers.Main) {
+                            val allNodes = _nodes.value.toMutableList()
+                            allNodes.removeAll { it.subscriptionUrl == sub.url }
+                            allNodes.addAll(newNodes)
+                            repository.saveNodes(allNodes)
+                            _nodes.value = allNodes
+                            
+                            val allSubs = _subscriptions.value.toMutableList()
+                            val idx = allSubs.indexOfFirst { it.url == sub.url }
+                            if (idx != -1) {
+                                allSubs[idx] = allSubs[idx].copy(lastUpdated = System.currentTimeMillis())
+                                repository.saveSubscriptions(allSubs)
+                                _subscriptions.value = allSubs
+                            }
+                            addLog("[订阅] 更新成功，导入 ${newNodes.size} 个节点")
+                        }
+                    } else {
+                        addLog("[错误] 订阅更新失败: ${response.code}")
+                    }
+                }
+            } catch (e: Exception) {
+                addLog("[错误] 网络请求异常: ${e.message}")
+            }
+        }
+    }
+
+    private fun scheduleSubscriptionUpdate(sub: Subscription) {
+        val intervalMinutes = when(sub.interval) {
+            UpdateInterval.DAILY -> 24L * 60
+            UpdateInterval.WEEKLY -> 7L * 24 * 60
+            UpdateInterval.CUSTOM -> sub.customDays.toLong() * 24 * 60
+        }
+
+        val workRequest = PeriodicWorkRequestBuilder<SubscriptionWorker>(
+            intervalMinutes, TimeUnit.MINUTES,
+            15, TimeUnit.MINUTES // 灵活时段
+        ).addTag(sub.url)
+         .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+         .build()
+
+        WorkManager.getInstance(getApplication()).enqueueUniquePeriodicWork(
+            sub.url,
+            ExistingPeriodicWorkPolicy.UPDATE,
+            workRequest
+        )
+    }
+
+    // --- 节点管理与 VPN ---
 
     fun toggleConnection() {
         viewModelScope.launch {
@@ -228,9 +362,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * 选择节点：如果当前正在连接，则自动执行“停止 -> 延迟 -> 启动”序列以切换配置
-     */
     fun selectNode(node: Node) {
         val wasConnected = _isConnected.value
         val updatedNode = node.copy(isSelected = true)
@@ -238,7 +369,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         addLog("[系统] 已选择: ${node.tag}")
 
         viewModelScope.launch {
-            // 更新持久化状态
             val currentList = _nodes.value.map { 
                 if (it.server == node.server && it.port == node.port && 
                     it.protocol == node.protocol && it.tag == node.tag) {
@@ -250,14 +380,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _nodes.value = currentList
             repository.saveNodes(currentList)
 
-            // [修复逻辑] 如果 VPN 正在运行，自动重启以应用新节点配置
             if (wasConnected) {
                 addLog("[系统] 检测到节点变更，正在自动重启服务...")
                 _vpnEventChannel.send(VpnEvent.StopVpn)
-                
-                // 延时确保 Go 核心释放网卡资源、FD 和单例变量
-                kotlinx.coroutines.delay(800) 
-                
+                delay(800) 
                 val json = generateConfigJson(updatedNode)
                 _vpnEventChannel.send(VpnEvent.StartVpn(json))
             }
@@ -268,15 +394,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val currentList = _nodes.value.toMutableList()
             val nodeToSave = if (currentList.isEmpty()) node.copy(isSelected = true) else node.copy(isSelected = false)
-            
             currentList.add(nodeToSave)
             repository.saveNodes(currentList)
             _nodes.value = currentList
-            
-            if (currentList.size == 1) {
-                _currentNode.value = nodeToSave
-            }
-            
+            if (currentList.size == 1) _currentNode.value = nodeToSave
             addLog("[系统] 已添加: ${node.tag}")
         }
     }
@@ -286,23 +407,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val currentList = _nodes.value.toMutableList()
             currentList.remove(node)
             repository.saveNodes(currentList)
-            
             if (_currentNode.value == node) {
                  if (currentList.isNotEmpty()) {
                      val nextNode = currentList[0].copy(isSelected = true)
                      _currentNode.value = nextNode
-                     val updatedList = currentList.mapIndexed { index, item ->
-                         if (index == 0) item.copy(isSelected = true) else item.copy(isSelected = false)
-                     }
-                     _nodes.value = updatedList
-                     repository.saveNodes(updatedList)
+                     _nodes.value = currentList.mapIndexed { i, it -> it.copy(isSelected = (i == 0)) }
                  } else {
                      _currentNode.value = Node("未选择", "none", "0.0.0.0", 0)
                      _nodes.value = emptyList()
                  }
-            } else {
-                _nodes.value = currentList
-            }
+            } else { _nodes.value = currentList }
             addLog("[系统] 已删除: ${node.tag}")
         }
     }
@@ -312,66 +426,38 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val currentList = _nodes.value.toMutableList()
             val index = currentList.indexOf(oldNode)
             if (index != -1) {
-                val isSelected = oldNode.isSelected || (_currentNode.value == oldNode)
-                val nodeToSave = newNode.copy(isSelected = isSelected)
-                
+                val nodeToSave = newNode.copy(isSelected = oldNode.isSelected)
                 currentList[index] = nodeToSave
                 repository.saveNodes(currentList)
-                
-                if (_currentNode.value == oldNode) {
-                    _currentNode.value = nodeToSave
-                }
-                
+                if (_currentNode.value == oldNode) _currentNode.value = nodeToSave
                 _nodes.value = currentList
                 addLog("[系统] 已更新: ${newNode.tag}")
             }
         }
     }
 
-    fun onVpnStarted() {
-        _isConnected.value = true
-        addLog("[核心] 已连通网络")
-    }
-
-    fun onVpnStopped() {
-        _isConnected.value = false
-        addLog("[核心] 连接已关闭")
-    }
+    fun onVpnStarted() { _isConnected.value = true; addLog("[核心] 已连通网络") }
+    fun onVpnStopped() { _isConnected.value = false; addLog("[核心] 连接已关闭") }
 
     fun importFromText(text: String, onResult: (Boolean, String) -> Unit) {
         val newNodes = NodeParser.parseList(text)
-        
         if (newNodes.isNotEmpty()) {
             viewModelScope.launch {
                 val current = _nodes.value.toMutableList()
                 var addedCount = 0
-                
                 for (node in newNodes) {
-                    val exists = current.any { 
-                        it.server == node.server && 
-                        it.port == node.port && 
-                        it.protocol == node.protocol 
-                    }
-                    
-                    if (!exists) {
+                    if (current.none { it.server == node.server && it.port == node.port && it.protocol == node.protocol }) {
                         current.add(node.copy(isSelected = false))
                         addedCount++
                     }
                 }
-
                 if (addedCount > 0) {
-                    repository.saveNodes(current)
-                    refreshNodes()
-                    val msg = "成功导入 $addedCount 个节点" + if (newNodes.size > addedCount) " (过滤 ${newNodes.size - addedCount} 个重复)" else ""
-                    addLog("[系统] $msg")
-                    onResult(true, msg)
-                } else {
-                    onResult(false, "节点已存在，未导入新节点")
-                }
+                    repository.saveNodes(current); refreshNodes()
+                    addLog("[系统] 成功导入 $addedCount 个节点")
+                    onResult(true, "导入成功")
+                } else onResult(false, "节点已存在")
             }
-        } else {
-            onResult(false, "未识别到有效的节点链接")
-        }
+        } else onResult(false, "未识别到节点")
     }
 
     fun addLog(msg: String) {
@@ -383,13 +469,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun generateConfigJson(node: Node): String {
         val useTls = node.sni.isNotEmpty() || node.transport == "ws" || node.port == 443
-
         val logPath = if (_loggingEnabled.value) {
             val logDir = getApplication<Application>().getExternalFilesDir(null)
             if (logDir != null) File(logDir, "mandala_core.log").absolutePath 
             else getApplication<Application>().filesDir.absolutePath + "/mandala_core.log"
         } else ""
-
         return """
         {
             "tag": "${node.tag}",
@@ -400,17 +484,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             "uuid": "${node.uuid}",
             "username": "${if(node.protocol == "socks5") node.uuid else ""}",
             "log_path": "$logPath",
-            "tls": { 
-                "enabled": $useTls, 
-                "server_name": "${if (node.sni.isEmpty()) node.server else node.sni}",
-                "insecure": ${_allowInsecure.value}
-            },
+            "tls": { "enabled": $useTls, "server_name": "${if (node.sni.isEmpty()) node.server else node.sni}", "insecure": ${_allowInsecure.value} },
             "transport": { "type": "${node.transport}", "path": "${node.path}" },
-            "settings": {
-                "vpn_mode": ${_vpnMode.value},
-                "fragment": ${_tlsFragment.value},
-                "noise": ${_randomPadding.value}
-            },
+            "settings": { "vpn_mode": ${_vpnMode.value}, "fragment": ${_tlsFragment.value}, "noise": ${_randomPadding.value} },
             "local_port": ${_localPort.value}
         }
         """.trimIndent()
