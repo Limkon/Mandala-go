@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"encoding/binary"
-	"fmt"
 	"io"
 	"log"
 	"net"
