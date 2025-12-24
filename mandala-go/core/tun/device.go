@@ -4,8 +4,8 @@ import (
 	"os"
 	"syscall"
 
+	"gvisor.dev/gvisor/pkg/buffer" // [修复] 使用正确的 buffer 包路径
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -56,10 +56,10 @@ func (d *Device) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 }
 
 func (d *Device) writePacket(pkt *stack.PacketBuffer) tcpip.Error {
-	// 获取数据视图
-	views := pkt.ToView().ToVectorisedView()
-	// 将数据合并为一个字节切片
-	data := views.ToView()
+	// [修复] 适配 2023 gVisor buffer API
+	// ToView() 返回 *buffer.View，使用 AsSlice() 获取字节切片
+	view := pkt.ToView()
+	data := view.AsSlice()
 
 	// 写入 TUN 设备
 	if _, err := syscall.Write(d.fd, data); err != nil {
@@ -71,7 +71,6 @@ func (d *Device) writePacket(pkt *stack.PacketBuffer) tcpip.Error {
 func (d *Device) Attach(dispatcher stack.NetworkDispatcher) {
 	d.dispatcher = dispatcher
 	// 启动读取循环
-	// 在 gVisor 集成中，我们需要一个机制将读取到的数据注入 dispatcher。
 	go d.readLoop()
 }
 
@@ -105,8 +104,10 @@ func (d *Device) readLoop() {
 		data := make([]byte, n)
 		copy(data, buf[:n])
 
+		// [修复] 使用 buffer.NewViewFromBytes 创建 View
+		// 然后使用 buffer.MakeWithData 创建 Buffer
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Payload: buffer.MakeWithData(buffer.View(data)),
+			Payload: buffer.MakeWithData(buffer.NewViewFromBytes(data)),
 		})
 
 		// 判断 IP 版本 (IPv4 vs IPv6)
