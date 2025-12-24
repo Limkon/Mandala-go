@@ -24,60 +24,54 @@ import com.example.mandala.viewmodel.MainViewModel
 
 @Composable
 fun SettingsScreen(viewModel: MainViewModel) {
-    // 收集状态
     val strings by viewModel.appStrings.collectAsState()
     val vpnMode by viewModel.vpnMode.collectAsState()
     val allowInsecure by viewModel.allowInsecure.collectAsState()
     val tlsFragment by viewModel.tlsFragment.collectAsState()
+    val fragmentSize by viewModel.fragmentSize.collectAsState() // [新增]
     val randomPadding by viewModel.randomPadding.collectAsState()
+    val noiseSize by viewModel.noiseSize.collectAsState() // [新增]
     val localPort by viewModel.localPort.collectAsState()
-    val loggingEnabled by viewModel.loggingEnabled.collectAsState() // [新增]
+    val loggingEnabled by viewModel.loggingEnabled.collectAsState()
     val themeMode by viewModel.themeMode.collectAsState()
     val language by viewModel.language.collectAsState()
 
-    // 端口编辑弹窗状态
     var showPortDialog by remember { mutableStateOf(false) }
+    var showFragmentDialog by remember { mutableStateOf(false) } // [新增]
+    var showNoiseDialog by remember { mutableStateOf(false) }   // [新增]
 
-    // 端口编辑逻辑
+    // --- 弹窗逻辑集锦 ---
+
     if (showPortDialog) {
-        var tempPort by remember { mutableStateOf(localPort.toString()) }
-        var isError by remember { mutableStateOf(false) }
+        PortEditDialog(
+            title = strings.localPort,
+            currentValue = localPort.toString(),
+            range = 1024..65535,
+            onConfirm = { viewModel.updateLocalPort(it) },
+            onDismiss = { showPortDialog = false },
+            strings = strings
+        )
+    }
 
-        AlertDialog(
-            onDismissRequest = { showPortDialog = false },
-            title = { Text(strings.localPort) },
-            text = {
-                Column {
-                    OutlinedTextField(
-                        value = tempPort,
-                        onValueChange = { 
-                            tempPort = it.filter { char -> char.isDigit() }
-                            isError = false
-                        },
-                        label = { Text("Port (1024-65535)") },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        isError = isError,
-                        singleLine = true
-                    )
-                    if (isError) {
-                        Text("无效端口", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    val p = tempPort.toIntOrNull()
-                    if (p != null && p in 1024..65535) {
-                        viewModel.updateLocalPort(tempPort)
-                        showPortDialog = false
-                    } else {
-                        isError = true
-                    }
-                }) { Text(strings.confirm) }
-            },
-            dismissButton = {
-                TextButton(onClick = { showPortDialog = false }) { Text(strings.cancel) }
-            }
+    if (showFragmentDialog) {
+        PortEditDialog(
+            title = strings.fragmentSize,
+            currentValue = fragmentSize.toString(),
+            range = 1..500,
+            onConfirm = { viewModel.updateFragmentSize(it) },
+            onDismiss = { showFragmentDialog = false },
+            strings = strings
+        )
+    }
+
+    if (showNoiseDialog) {
+        PortEditDialog(
+            title = strings.noiseSize,
+            currentValue = noiseSize.toString(),
+            range = 1..2000,
+            onConfirm = { viewModel.updateNoiseSize(it) },
+            onDismiss = { showNoiseDialog = false },
+            strings = strings
         )
     }
 
@@ -114,20 +108,38 @@ fun SettingsScreen(viewModel: MainViewModel) {
                 checked = tlsFragment,
                 onCheckedChange = { viewModel.updateSetting("tls_fragment", it) }
             )
+            // [新增] 自定义分片大小入口
+            if (tlsFragment) {
+                ClickableSetting(
+                    title = strings.fragmentSize,
+                    value = fragmentSize.toString(),
+                    icon = Icons.Default.Edit,
+                    onClick = { showFragmentDialog = true }
+                )
+            }
+
             SwitchSetting(
                 title = strings.randomPadding,
                 subtitle = strings.randomPaddingDesc,
                 checked = randomPadding,
                 onCheckedChange = { viewModel.updateSetting("random_padding", it) }
             )
-            // [新增] 日志开关
+            // [新增] 自定义填充大小入口
+            if (randomPadding) {
+                ClickableSetting(
+                    title = strings.noiseSize,
+                    value = noiseSize.toString(),
+                    icon = Icons.Default.Edit,
+                    onClick = { showNoiseDialog = true }
+                )
+            }
+
             SwitchSetting(
                 title = strings.enableLogging,
                 subtitle = strings.enableLoggingDesc,
                 checked = loggingEnabled,
                 onCheckedChange = { viewModel.updateSetting("logging_enabled", it) }
             )
-            // 可点击的端口设置
             ClickableSetting(
                 title = strings.localPort,
                 value = localPort.toString(),
@@ -138,7 +150,6 @@ fun SettingsScreen(viewModel: MainViewModel) {
 
         // --- 应用设置 (主题与语言) ---
         SettingSection(strings.appSettings) {
-            // 主题选择
             DropdownSetting(
                 title = strings.theme,
                 currentValue = when(themeMode) {
@@ -151,8 +162,6 @@ fun SettingsScreen(viewModel: MainViewModel) {
                     viewModel.updateTheme(AppThemeMode.values()[index])
                 }
             )
-
-            // 语言选择
             DropdownSetting(
                 title = strings.language,
                 currentValue = when(language) {
@@ -168,49 +177,78 @@ fun SettingsScreen(viewModel: MainViewModel) {
 
         // --- 关于 ---
         SettingSection(strings.about) {
-            Text(
-                "Mandala Client v1.1.0",
-                style = MaterialTheme.typography.bodyMedium,
-                color = Color.Gray
-            )
-            Text(
-                "Core: Go 1.23 / Gomobile",
-                style = MaterialTheme.typography.bodyMedium,
-                color = Color.Gray
-            )
+            Text("Mandala Client v1.1.0", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
+            Text("Core: Go 1.23 / Gomobile", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
         }
     }
 }
 
-// --- 组件封装 ---
+// --- 通用数值编辑弹窗组件 ---
+@Composable
+fun PortEditDialog(
+    title: String,
+    currentValue: String,
+    range: IntRange,
+    onConfirm: (String) -> Unit,
+    onDismiss: () -> Unit,
+    strings: com.example.mandala.viewmodel.AppStrings
+) {
+    var tempVal by remember { mutableStateOf(currentValue) }
+    var isError by remember { mutableStateOf(false) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = tempVal,
+                    onValueChange = { 
+                        tempVal = it.filter { char -> char.isDigit() }
+                        isError = false
+                    },
+                    label = { Text("范围: ${range.first} - ${range.last}") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    isError = isError,
+                    singleLine = true
+                )
+                if (isError) {
+                    Text("输入无效", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                val v = tempVal.toIntOrNull()
+                if (v != null && v in range) {
+                    onConfirm(tempVal)
+                    onDismiss()
+                } else {
+                    isError = true
+                }
+            }) { Text(strings.confirm) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(strings.cancel) }
+        }
+    )
+}
+
+// --- 其余 UI 封装组件保持不变 ---
 
 @Composable
 fun SettingSection(title: String, content: @Composable ColumnScope.() -> Unit) {
-    Text(
-        title,
-        color = MaterialTheme.colorScheme.primary,
-        style = MaterialTheme.typography.titleSmall,
-        fontWeight = FontWeight.Bold
-    )
+    Text(title, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
     Spacer(modifier = Modifier.height(8.dp))
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            content()
-        }
+    Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+        Column(modifier = Modifier.padding(16.dp)) { content() }
     }
     Spacer(modifier = Modifier.height(24.dp))
 }
 
 @Composable
 fun SwitchSetting(title: String, subtitle: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
+    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
         Column(modifier = Modifier.weight(1f)) {
             Text(title, style = MaterialTheme.typography.titleMedium)
             Text(subtitle, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
@@ -221,14 +259,7 @@ fun SwitchSetting(title: String, subtitle: String, checked: Boolean, onCheckedCh
 
 @Composable
 fun ClickableSetting(title: String, value: String, icon: androidx.compose.ui.graphics.vector.ImageVector, onClick: () -> Unit) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick)
-            .padding(vertical = 12.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
+    Row(modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 12.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
         Text(title, style = MaterialTheme.typography.titleMedium)
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(value, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Bold, color = Color.Gray)
@@ -241,34 +272,16 @@ fun ClickableSetting(title: String, value: String, icon: androidx.compose.ui.gra
 @Composable
 fun DropdownSetting(title: String, currentValue: String, options: List<String>, onOptionSelected: (Int) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
-
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { expanded = true }
-            .padding(vertical = 12.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
+    Row(modifier = Modifier.fillMaxWidth().clickable { expanded = true }.padding(vertical = 12.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
         Text(title, style = MaterialTheme.typography.titleMedium)
-        
         Box {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(currentValue, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-                Icon(Icons.Default.ArrowDropDown, contentDescription = null)
+                Icon(com.example.mandala.MainActivity().let { Icons.Default.ArrowDropDown }, contentDescription = null)
             }
-            DropdownMenu(
-                expanded = expanded,
-                onDismissRequest = { expanded = false }
-            ) {
+            DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
                 options.forEachIndexed { index, label ->
-                    DropdownMenuItem(
-                        text = { Text(label) },
-                        onClick = {
-                            onOptionSelected(index)
-                            expanded = false
-                        }
-                    )
+                    DropdownMenuItem(text = { Text(label) }, onClick = { onOptionSelected(index); expanded = false })
                 }
             }
         }
