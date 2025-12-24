@@ -45,7 +45,7 @@ data class AppStrings(
     val deleteConfirm: String,
     val tag: String, val address: String, val port: String,
     val password: String, val uuid: String, val sni: String,
-    val subscription: String, val addSubscription: String, val subUrl: String,
+    val subscription: String, val addSubscription: String, val editSubscription: String, val subUrl: String,
     val updateInterval: String, val daily: String, val weekly: String, val custom: String,
     val updateNow: String, val lastUpdate: String, val neverUpdate: String
 )
@@ -71,7 +71,7 @@ val ChineseStrings = AppStrings(
     deleteConfirm = "确定要删除吗？",
     tag = "备注", address = "地址", port = "端口",
     password = "密码", uuid = "UUID", sni = "SNI (域名)",
-    subscription = "订阅管理", addSubscription = "添加订阅", subUrl = "订阅地址 (URL)",
+    subscription = "订阅管理", addSubscription = "添加订阅", editSubscription = "编辑订阅", subUrl = "订阅地址 (URL)",
     updateInterval = "更新频率", daily = "每天", weekly = "每周", custom = "自定义天数",
     updateNow = "立即更新", lastUpdate = "最后更新", neverUpdate = "从未更新"
 )
@@ -97,7 +97,7 @@ val EnglishStrings = AppStrings(
     deleteConfirm = "Are you sure you want to delete?",
     tag = "Tag", address = "Address", port = "Port",
     password = "Password", uuid = "UUID", sni = "SNI",
-    subscription = "Subscriptions", addSubscription = "Add Sub", subUrl = "Subscription URL",
+    subscription = "Subscriptions", addSubscription = "Add Sub", editSubscription = "Edit Sub", subUrl = "Subscription URL",
     updateInterval = "Update Interval", daily = "Daily", weekly = "Weekly", custom = "Custom Days",
     updateNow = "Update Now", lastUpdate = "Last update", neverUpdate = "Never"
 )
@@ -113,7 +113,7 @@ data class Node(
     val path: String = "/",
     val sni: String = "",
     val isSelected: Boolean = false,
-    val subscriptionUrl: String? = null // [新增] 标记所属订阅
+    val subscriptionUrl: String? = null 
 )
 
 enum class UpdateInterval { DAILY, WEEKLY, CUSTOM }
@@ -265,6 +265,38 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun updateSubscription(oldSub: Subscription, newSub: Subscription) {
+        viewModelScope.launch {
+            val current = _subscriptions.value.toMutableList()
+            val index = current.indexOfFirst { it.url == oldSub.url }
+            if (index != -1) {
+                // 如果 URL 变更，处理关联节点和旧任务
+                if (oldSub.url != newSub.url) {
+                    WorkManager.getInstance(getApplication()).cancelUniqueWork(oldSub.url)
+                    val currentNodes = _nodes.value.toMutableList()
+                    var nodesChanged = false
+                    currentNodes.forEachIndexed { i, node ->
+                        if (node.subscriptionUrl == oldSub.url) {
+                            currentNodes[i] = node.copy(subscriptionUrl = newSub.url)
+                            nodesChanged = true
+                        }
+                    }
+                    if (nodesChanged) {
+                        repository.saveNodes(currentNodes)
+                        _nodes.value = currentNodes
+                    }
+                }
+
+                val updatedSub = newSub.copy(lastUpdated = oldSub.lastUpdated)
+                current[index] = updatedSub
+                repository.saveSubscriptions(current)
+                _subscriptions.value = current
+                scheduleSubscriptionUpdate(updatedSub)
+                addLog("[订阅] 已更新: ${updatedSub.tag}")
+            }
+        }
+    }
+
     fun deleteSubscription(sub: Subscription) {
         viewModelScope.launch {
             val current = _subscriptions.value.toMutableList()
@@ -272,14 +304,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             repository.saveSubscriptions(current)
             _subscriptions.value = current
             
-            // 删除该订阅关联的节点
             val currentNodes = _nodes.value.toMutableList()
             currentNodes.removeAll { it.subscriptionUrl == sub.url }
             repository.saveNodes(currentNodes)
             _nodes.value = currentNodes
             
-            // 取消定时任务
-            WorkManager.getInstance(getApplication()).cancelAllWorkByTag(sub.url)
+            WorkManager.getInstance(getApplication()).cancelUniqueWork(sub.url)
             addLog("[订阅] 已移除: ${sub.tag}")
         }
     }
@@ -331,7 +361,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         val workRequest = PeriodicWorkRequestBuilder<SubscriptionWorker>(
             intervalMinutes, TimeUnit.MINUTES,
-            15, TimeUnit.MINUTES // 灵活时段
+            15, TimeUnit.MINUTES 
         ).addTag(sub.url)
          .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
          .build()
