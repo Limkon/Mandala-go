@@ -17,7 +17,7 @@ type Device struct {
 	dispatcher stack.NetworkDispatcher
 }
 
-// [修复] 增加 mtu 参数
+// NewDevice 创建 TUN 设备适配器
 func NewDevice(fd int, mtu uint32) (*Device, error) {
 	return &Device{
 		fd:  fd,
@@ -25,7 +25,9 @@ func NewDevice(fd int, mtu uint32) (*Device, error) {
 	}, nil
 }
 
-// 实现 LinkEndpoint 接口所需的方法
+// ---------------------------------------------------------
+// 实现 stack.LinkEndpoint 接口方法
+// ---------------------------------------------------------
 
 func (d *Device) MTU() uint32 {
 	return d.mtu
@@ -43,8 +45,8 @@ func (d *Device) LinkAddress() tcpip.LinkAddress {
 	return ""
 }
 
+// WritePackets 将数据包写入 TUN 设备
 func (d *Device) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
-	// 简单实现：遍历写入
 	count := 0
 	for _, pkt := range pkts.AsSlice() {
 		if err := d.writePacket(pkt); err != nil {
@@ -56,14 +58,14 @@ func (d *Device) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 }
 
 func (d *Device) writePacket(pkt *stack.PacketBuffer) tcpip.Error {
-	// [修复] 适配 2023 gVisor buffer API
-	// ToView() 返回 *buffer.View，使用 AsSlice() 获取字节切片
+	// [修复] 适配 2023 gVisor API: 使用 ToView().AsSlice() 获取数据
 	view := pkt.ToView()
 	data := view.AsSlice()
 
-	// 写入 TUN 设备
+	// 写入文件描述符
 	if _, err := syscall.Write(d.fd, data); err != nil {
-		return &tcpip.ErrInvalidOption{} // 返回通用错误
+		// [修复] 使用 ErrClosedForSend 替代未定义的 ErrInvalidOption
+		return &tcpip.ErrClosedForSend{}
 	}
 	return nil
 }
@@ -80,7 +82,6 @@ func (d *Device) IsAttached() bool {
 
 func (d *Device) Wait() {}
 
-// [修复] 实现缺失的 ARPHardwareType 方法
 func (d *Device) ARPHardwareType() header.ARPHardwareType {
 	return header.ARPHardwareNone
 }
@@ -88,7 +89,11 @@ func (d *Device) ARPHardwareType() header.ARPHardwareType {
 func (d *Device) AddHeader(pkt *stack.PacketBuffer) {}
 func (d *Device) ParseHeader(pkt *stack.PacketBuffer) bool { return true }
 
-// readLoop 从文件描述符读取数据并分发给网络栈
+// ---------------------------------------------------------
+// 内部逻辑
+// ---------------------------------------------------------
+
+// readLoop 从 TUN 读取数据并注入协议栈
 func (d *Device) readLoop() {
 	buf := make([]byte, d.mtu)
 	for {
@@ -100,17 +105,17 @@ func (d *Device) readLoop() {
 			continue
 		}
 
-		// 复制数据，因为 buffer 会被重用
+		// 复制数据，因为 buf 会被重用
 		data := make([]byte, n)
 		copy(data, buf[:n])
 
-		// [修复] 使用 buffer.NewViewFromBytes 创建 View
-		// 然后使用 buffer.MakeWithData 创建 Buffer
+		// [修复] 直接使用 buffer.MakeWithData(data) 创建 Payload
+		// 这样避免了调用 undefined 的 NewViewFromBytes
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Payload: buffer.MakeWithData(buffer.NewViewFromBytes(data)),
+			Payload: buffer.MakeWithData(data),
 		})
 
-		// 判断 IP 版本 (IPv4 vs IPv6)
+		// 简单判断 IP 版本 (IPv4 vs IPv6)
 		var proto tcpip.NetworkProtocolNumber
 		if n > 0 {
 			switch data[0] >> 4 {
