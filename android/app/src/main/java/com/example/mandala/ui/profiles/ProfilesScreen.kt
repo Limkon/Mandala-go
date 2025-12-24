@@ -27,7 +27,6 @@ import java.util.*
 @Composable
 fun ProfilesScreen(viewModel: MainViewModel) {
     val nodes by viewModel.nodes.collectAsState()
-    val subscriptions by viewModel.subscriptions.collectAsState()
     val strings by viewModel.appStrings.collectAsState()
     
     var showNodeEditDialog by remember { mutableStateOf(false) }
@@ -154,7 +153,8 @@ fun NodeItem(node: Node, onEdit: () -> Unit, onDelete: () -> Unit, onSelect: () 
 fun SubscriptionManagementDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
     val subs by viewModel.subscriptions.collectAsState()
     val strings by viewModel.appStrings.collectAsState()
-    var showAddSubDialog by remember { mutableStateOf(false) }
+    var showEditSubDialog by remember { mutableStateOf(false) }
+    var currentSub by remember { mutableStateOf<Subscription?>(null) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -166,12 +166,18 @@ fun SubscriptionManagementDialog(viewModel: MainViewModel, onDismiss: () -> Unit
                 } else {
                     LazyColumn {
                         items(subs) { sub ->
-                            SubscriptionItem(sub, viewModel, strings)
+                            SubscriptionItem(
+                                sub = sub, 
+                                strings = strings,
+                                onUpdate = { viewModel.updateSubscriptionContent(sub) },
+                                onEdit = { currentSub = sub; showEditSubDialog = true },
+                                onDelete = { viewModel.deleteSubscription(sub) }
+                            )
                         }
                     }
                 }
                 TextButton(
-                    onClick = { showAddSubDialog = true },
+                    onClick = { currentSub = null; showEditSubDialog = true },
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
                 ) {
                     Icon(Icons.Default.Add, null)
@@ -183,20 +189,32 @@ fun SubscriptionManagementDialog(viewModel: MainViewModel, onDismiss: () -> Unit
         confirmButton = { TextButton(onClick = onDismiss) { Text(strings.confirm) } }
     )
 
-    if (showAddSubDialog) {
-        AddSubscriptionDialog(
+    if (showEditSubDialog) {
+        SubscriptionEditDialog(
+            subscription = currentSub,
             strings = strings,
-            onDismiss = { showAddSubDialog = false },
+            onDismiss = { showEditSubDialog = false },
             onSave = { tag, url, interval, customDays ->
-                viewModel.addSubscription(Subscription(url, tag, interval = interval, customDays = customDays))
-                showAddSubDialog = false
+                val newSub = Subscription(url, tag, interval = interval, customDays = customDays)
+                if (currentSub == null) {
+                    viewModel.addSubscription(newSub)
+                } else {
+                    viewModel.updateSubscription(currentSub!!, newSub)
+                }
+                showEditSubDialog = false
             }
         )
     }
 }
 
 @Composable
-fun SubscriptionItem(sub: Subscription, viewModel: MainViewModel, strings: AppStrings) {
+fun SubscriptionItem(
+    sub: Subscription, 
+    strings: AppStrings, 
+    onUpdate: () -> Unit,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit
+) {
     val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
     val lastUpdateStr = if (sub.lastUpdated == 0L) strings.neverUpdate else sdf.format(Date(sub.lastUpdated))
 
@@ -204,11 +222,15 @@ fun SubscriptionItem(sub: Subscription, viewModel: MainViewModel, strings: AppSt
         Column(modifier = Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(sub.tag, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                IconButton(onClick = { viewModel.updateSubscriptionContent(sub) }, modifier = Modifier.size(24.dp)) {
+                IconButton(onClick = onUpdate, modifier = Modifier.size(24.dp)) {
                     Icon(Icons.Default.Refresh, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
                 }
-                Spacer(Modifier.width(12.dp))
-                IconButton(onClick = { viewModel.deleteSubscription(sub) }, modifier = Modifier.size(24.dp)) {
+                Spacer(Modifier.width(8.dp))
+                IconButton(onClick = onEdit, modifier = Modifier.size(24.dp)) {
+                    Icon(Icons.Default.Edit, null, tint = MaterialTheme.colorScheme.secondary, modifier = Modifier.size(18.dp))
+                }
+                Spacer(Modifier.width(8.dp))
+                IconButton(onClick = onDelete, modifier = Modifier.size(24.dp)) {
                     Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(18.dp))
                 }
             }
@@ -221,21 +243,26 @@ fun SubscriptionItem(sub: Subscription, viewModel: MainViewModel, strings: AppSt
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AddSubscriptionDialog(strings: AppStrings, onDismiss: () -> Unit, onSave: (String, String, UpdateInterval, Int) -> Unit) {
-    var tag by remember { mutableStateOf("") }
-    var url by remember { mutableStateOf("") }
-    var interval by remember { mutableStateOf(UpdateInterval.DAILY) }
-    var customDays by remember { mutableStateOf("1") }
+fun SubscriptionEditDialog(
+    subscription: Subscription?,
+    strings: AppStrings, 
+    onDismiss: () -> Unit, 
+    onSave: (String, String, UpdateInterval, Int) -> Unit
+) {
+    var tag by remember { mutableStateOf(subscription?.tag ?: "") }
+    var url by remember { mutableStateOf(subscription?.url ?: "") }
+    var interval by remember { mutableStateOf(subscription?.interval ?: UpdateInterval.DAILY) }
+    var customDays by remember { mutableStateOf(subscription?.customDays?.toString() ?: "1") }
     var expandedInterval by remember { mutableStateOf(false) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(strings.addSubscription) },
+        title = { Text(if (subscription == null) strings.addSubscription else strings.editSubscription) },
         text = {
             Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
-                OutlinedTextField(value = tag, onValueChange = { tag = it }, label = { Text(strings.tag) }, singleLine = true)
+                OutlinedTextField(value = tag, onValueChange = { tag = it }, label = { Text(strings.tag) }, modifier = Modifier.fillMaxWidth(), singleLine = true)
                 Spacer(Modifier.height(8.dp))
-                OutlinedTextField(value = url, onValueChange = { url = it }, label = { Text(strings.subUrl) }, singleLine = true)
+                OutlinedTextField(value = url, onValueChange = { url = it }, label = { Text(strings.subUrl) }, modifier = Modifier.fillMaxWidth(), singleLine = true)
                 Spacer(Modifier.height(16.dp))
                 
                 ExposedDropdownMenuBox(expanded = expandedInterval, onExpandedChange = { expandedInterval = !expandedInterval }) {
@@ -258,7 +285,13 @@ fun AddSubscriptionDialog(strings: AppStrings, onDismiss: () -> Unit, onSave: (S
 
                 if (interval == UpdateInterval.CUSTOM) {
                     Spacer(Modifier.height(8.dp))
-                    OutlinedTextField(value = customDays, onValueChange = { customDays = it.filter { it.isDigit() } }, label = { Text("天数") }, singleLine = true)
+                    OutlinedTextField(
+                        value = customDays, 
+                        onValueChange = { customDays = it.filter { c -> c.isDigit() } }, 
+                        label = { Text("天数") }, 
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
                 }
             }
         },
