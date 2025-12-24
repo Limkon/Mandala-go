@@ -2,7 +2,6 @@
 
 package com.example.mandala.ui.settings
 
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -30,61 +29,57 @@ fun SettingsScreen(viewModel: MainViewModel) {
     val vpnMode by viewModel.vpnMode.collectAsState()
     val allowInsecure by viewModel.allowInsecure.collectAsState()
     val tlsFragment by viewModel.tlsFragment.collectAsState()
-    val fragmentSize by viewModel.fragmentSize.collectAsState() // [新增]
     val randomPadding by viewModel.randomPadding.collectAsState()
-    val noiseSize by viewModel.noiseSize.collectAsState() // [新增]
     val localPort by viewModel.localPort.collectAsState()
-    val loggingEnabled by viewModel.loggingEnabled.collectAsState()
+    val loggingEnabled by viewModel.loggingEnabled.collectAsState() // [新增]
     val themeMode by viewModel.themeMode.collectAsState()
     val language by viewModel.language.collectAsState()
 
-    // 弹窗状态
+    // 端口编辑弹窗状态
     var showPortDialog by remember { mutableStateOf(false) }
-    var showFragmentDialog by remember { mutableStateOf(false) } // [新增]
-    var showNoiseDialog by remember { mutableStateOf(false) }    // [新增]
 
-    // --- 弹窗逻辑 ---
-
-    // 1. 端口编辑弹窗
+    // 端口编辑逻辑
     if (showPortDialog) {
-        EditNumberDialog(
-            title = strings.localPort,
-            initialValue = localPort.toString(),
-            onConfirm = { viewModel.updateLocalPort(it); showPortDialog = false },
-            onDismiss = { showPortDialog = false },
-            range = 1024..65535,
-            confirmText = strings.confirm,
-            cancelText = strings.cancel
+        var tempPort by remember { mutableStateOf(localPort.toString()) }
+        var isError by remember { mutableStateOf(false) }
+
+        AlertDialog(
+            onDismissRequest = { showPortDialog = false },
+            title = { Text(strings.localPort) },
+            text = {
+                Column {
+                    OutlinedTextField(
+                        value = tempPort,
+                        onValueChange = { 
+                            tempPort = it.filter { char -> char.isDigit() }
+                            isError = false
+                        },
+                        label = { Text("Port (1024-65535)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        isError = isError,
+                        singleLine = true
+                    )
+                    if (isError) {
+                        Text("无效端口", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val p = tempPort.toIntOrNull()
+                    if (p != null && p in 1024..65535) {
+                        viewModel.updateLocalPort(tempPort)
+                        showPortDialog = false
+                    } else {
+                        isError = true
+                    }
+                }) { Text(strings.confirm) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showPortDialog = false }) { Text(strings.cancel) }
+            }
         )
     }
-
-    // 2. [新增] 分片大小编辑弹窗
-    if (showFragmentDialog) {
-        EditNumberDialog(
-            title = strings.fragmentSize,
-            initialValue = fragmentSize.toString(),
-            onConfirm = { viewModel.updateFragmentSize(it); showFragmentDialog = false },
-            onDismiss = { showFragmentDialog = false },
-            range = 1..10000, // 合理范围
-            confirmText = strings.confirm,
-            cancelText = strings.cancel
-        )
-    }
-
-    // 3. [新增] 填充大小编辑弹窗
-    if (showNoiseDialog) {
-        EditNumberDialog(
-            title = strings.noiseSize,
-            initialValue = noiseSize.toString(),
-            onConfirm = { viewModel.updateNoiseSize(it); showNoiseDialog = false },
-            onDismiss = { showNoiseDialog = false },
-            range = 0..10000,
-            confirmText = strings.confirm,
-            cancelText = strings.cancel
-        )
-    }
-
-    // --- 界面布局 ---
 
     Column(
         modifier = Modifier
@@ -113,53 +108,26 @@ fun SettingsScreen(viewModel: MainViewModel) {
 
         // --- 协议参数 ---
         SettingSection(strings.protocolSettings) {
-            // TLS 分片设置
             SwitchSetting(
                 title = strings.tlsFragment,
                 subtitle = strings.tlsFragmentDesc,
                 checked = tlsFragment,
                 onCheckedChange = { viewModel.updateSetting("tls_fragment", it) }
             )
-            // [新增] 仅在开启分片时显示大小设置
-            AnimatedVisibility(visible = tlsFragment) {
-                ClickableSetting(
-                    title = strings.fragmentSize,
-                    value = "$fragmentSize Byte",
-                    icon = Icons.Default.Edit,
-                    onClick = { showFragmentDialog = true }
-                )
-            }
-
-            Divider(modifier = Modifier.padding(vertical = 8.dp), color = Color.LightGray.copy(alpha = 0.3f))
-
-            // 随机填充设置
             SwitchSetting(
                 title = strings.randomPadding,
                 subtitle = strings.randomPaddingDesc,
                 checked = randomPadding,
                 onCheckedChange = { viewModel.updateSetting("random_padding", it) }
             )
-            // [新增] 仅在开启填充时显示大小设置
-            AnimatedVisibility(visible = randomPadding) {
-                ClickableSetting(
-                    title = strings.noiseSize,
-                    value = "$noiseSize Byte",
-                    icon = Icons.Default.Edit,
-                    onClick = { showNoiseDialog = true }
-                )
-            }
-
-            Divider(modifier = Modifier.padding(vertical = 8.dp), color = Color.LightGray.copy(alpha = 0.3f))
-
-            // 日志开关
+            // [新增] 日志开关
             SwitchSetting(
                 title = strings.enableLogging,
                 subtitle = strings.enableLoggingDesc,
                 checked = loggingEnabled,
                 onCheckedChange = { viewModel.updateSetting("logging_enabled", it) }
             )
-            
-            // 本地端口
+            // 可点击的端口设置
             ClickableSetting(
                 title = strings.localPort,
                 value = localPort.toString(),
@@ -170,6 +138,7 @@ fun SettingsScreen(viewModel: MainViewModel) {
 
         // --- 应用设置 (主题与语言) ---
         SettingSection(strings.appSettings) {
+            // 主题选择
             DropdownSetting(
                 title = strings.theme,
                 currentValue = when(themeMode) {
@@ -183,6 +152,7 @@ fun SettingsScreen(viewModel: MainViewModel) {
                 }
             )
 
+            // 语言选择
             DropdownSetting(
                 title = strings.language,
                 currentValue = when(language) {
@@ -199,7 +169,7 @@ fun SettingsScreen(viewModel: MainViewModel) {
         // --- 关于 ---
         SettingSection(strings.about) {
             Text(
-                "Mandala Client v1.2.0", // 版本号小幅升级
+                "Mandala Client v1.1.0",
                 style = MaterialTheme.typography.bodyMedium,
                 color = Color.Gray
             )
@@ -213,57 +183,6 @@ fun SettingsScreen(viewModel: MainViewModel) {
 }
 
 // --- 组件封装 ---
-
-// [新增] 通用数字编辑弹窗
-@Composable
-fun EditNumberDialog(
-    title: String,
-    initialValue: String,
-    onConfirm: (String) -> Unit,
-    onDismiss: () -> Unit,
-    range: IntRange,
-    confirmText: String,
-    cancelText: String
-) {
-    var tempValue by remember { mutableStateOf(initialValue) }
-    var isError by remember { mutableStateOf(false) }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(title) },
-        text = {
-            Column {
-                OutlinedTextField(
-                    value = tempValue,
-                    onValueChange = { 
-                        tempValue = it.filter { char -> char.isDigit() }
-                        isError = false
-                    },
-                    label = { Text("Value (${range.first}-${range.last})") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    isError = isError,
-                    singleLine = true
-                )
-                if (isError) {
-                    Text("数值无效", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = {
-                val p = tempValue.toIntOrNull()
-                if (p != null && p in range) {
-                    onConfirm(tempValue)
-                } else {
-                    isError = true
-                }
-            }) { Text(confirmText) }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text(cancelText) }
-        }
-    )
-}
 
 @Composable
 fun SettingSection(title: String, content: @Composable ColumnScope.() -> Unit) {

@@ -1,3 +1,5 @@
+// 文件路径: android/app/src/main/java/com/example/mandala/viewmodel/MainViewModel.kt
+
 package com.example.mandala.viewmodel
 
 import android.app.Application
@@ -33,11 +35,7 @@ data class AppStrings(
     val allowInsecure: String, val allowInsecureDesc: String,
     val protocolSettings: String,
     val tlsFragment: String, val tlsFragmentDesc: String,
-    // [新增] 分片大小文本
-    val fragmentSize: String,
     val randomPadding: String, val randomPaddingDesc: String,
-    // [新增] 填充大小文本
-    val noiseSize: String,
     val localPort: String,
     val enableLogging: String,
     val enableLoggingDesc: String,
@@ -63,9 +61,7 @@ val ChineseStrings = AppStrings(
     allowInsecure = "允许不安全连接", allowInsecureDesc = "跳过 TLS 证书验证 (危险)",
     protocolSettings = "协议参数 (核心)",
     tlsFragment = "TLS 分片", tlsFragmentDesc = "拆分 TLS 记录以绕过 DPI 检测",
-    fragmentSize = "分片大小 (字节)",
     randomPadding = "随机填充", randomPaddingDesc = "向数据包添加随机噪音",
-    noiseSize = "最大填充大小 (字节)",
     localPort = "本地监听端口",
     enableLogging = "启用日志记录",
     enableLoggingDesc = "将核心运行日志保存到本地文件以便调试",
@@ -91,9 +87,7 @@ val EnglishStrings = AppStrings(
     allowInsecure = "Insecure", allowInsecureDesc = "Skip TLS verification (Dangerous)",
     protocolSettings = "Protocol",
     tlsFragment = "TLS Fragment", tlsFragmentDesc = "Split TLS records to bypass DPI",
-    fragmentSize = "Fragment Size (Bytes)",
     randomPadding = "Random Padding", randomPaddingDesc = "Add random noise to packets",
-    noiseSize = "Max Padding Size (Bytes)",
     localPort = "Local Port",
     enableLogging = "Enable Logging",
     enableLoggingDesc = "Save core logs to local file for debugging",
@@ -170,16 +164,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _tlsFragment = MutableStateFlow(prefs.getBoolean("tls_fragment", true))
     val tlsFragment = _tlsFragment.asStateFlow()
 
-    // [新增] 分片大小，默认 100 字节
-    private val _fragmentSize = MutableStateFlow(prefs.getInt("fragment_size", 100))
-    val fragmentSize = _fragmentSize.asStateFlow()
-
     private val _randomPadding = MutableStateFlow(prefs.getBoolean("random_padding", false))
     val randomPadding = _randomPadding.asStateFlow()
-
-    // [新增] 随机填充大小，默认 500 字节
-    private val _noiseSize = MutableStateFlow(prefs.getInt("noise_size", 500))
-    val noiseSize = _noiseSize.asStateFlow()
 
     private val _localPort = MutableStateFlow(prefs.getInt("local_port", 10809))
     val localPort = _localPort.asStateFlow()
@@ -214,7 +200,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _isConnected.value = Mobile.isRunning()
     }
 
-    // --- 设置更新方法 ---
+    // --- 设置与基础数据刷新 ---
 
     fun updateSetting(key: String, value: Boolean) {
         prefs.edit().putBoolean(key, value).apply()
@@ -224,24 +210,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             "tls_fragment" -> _tlsFragment.value = value
             "random_padding" -> _randomPadding.value = value
             "logging_enabled" -> _loggingEnabled.value = value
-        }
-    }
-
-    // [新增] 更新分片大小
-    fun updateFragmentSize(sizeStr: String) {
-        val size = sizeStr.toIntOrNull()
-        if (size != null && size > 0) {
-            prefs.edit().putInt("fragment_size", size).apply()
-            _fragmentSize.value = size
-        }
-    }
-
-    // [新增] 更新填充大小
-    fun updateNoiseSize(sizeStr: String) {
-        val size = sizeStr.toIntOrNull()
-        if (size != null && size >= 0) {
-            prefs.edit().putInt("noise_size", size).apply()
-            _noiseSize.value = size
         }
     }
 
@@ -262,8 +230,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         prefs.edit().putInt("app_language", lang.ordinal).apply()
         _language.value = lang
     }
-
-    // --- 节点数据操作 ---
 
     fun refreshNodes() {
         viewModelScope.launch {
@@ -304,6 +270,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val current = _subscriptions.value.toMutableList()
             val index = current.indexOfFirst { it.url == oldSub.url }
             if (index != -1) {
+                // 如果 URL 变更，处理关联节点和旧任务
                 if (oldSub.url != newSub.url) {
                     WorkManager.getInstance(getApplication()).cancelUniqueWork(oldSub.url)
                     val currentNodes = _nodes.value.toMutableList()
@@ -406,7 +373,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
-    // --- 节点管理与 VPN 控制 ---
+    // --- 节点管理与 VPN ---
 
     fun toggleConnection() {
         viewModelScope.launch {
@@ -537,8 +504,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (logDir != null) File(logDir, "mandala_core.log").absolutePath 
             else getApplication<Application>().filesDir.absolutePath + "/mandala_core.log"
         } else ""
-        
-        // [修改] 生成完整的配置 JSON，包含自定义的分片和填充大小
         return """
         {
             "tag": "${node.tag}",
@@ -551,13 +516,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             "log_path": "$logPath",
             "tls": { "enabled": $useTls, "server_name": "${if (node.sni.isEmpty()) node.server else node.sni}", "insecure": ${_allowInsecure.value} },
             "transport": { "type": "${node.transport}", "path": "${node.path}" },
-            "settings": { 
-                "vpn_mode": ${_vpnMode.value}, 
-                "fragment": ${_tlsFragment.value}, 
-                "fragment_size": ${_fragmentSize.value},
-                "noise": ${_randomPadding.value},
-                "noise_size": ${_noiseSize.value}
-            },
+            "settings": { "vpn_mode": ${_vpnMode.value}, "fragment": ${_tlsFragment.value}, "noise": ${_randomPadding.value} },
             "local_port": ${_localPort.value}
         }
         """.trimIndent()

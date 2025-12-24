@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -28,7 +29,6 @@ func init() {
 	log.SetPrefix("GoLog: ")
 }
 
-// Stack 封装了用户态网络栈和代理逻辑
 type Stack struct {
 	stack     *stack.Stack
 	device    *Device
@@ -40,24 +40,47 @@ type Stack struct {
 	closeOnce sync.Once
 }
 
-func StartStack(fd int, cfg *config.OutboundConfig) (*Stack, error) {
-	// 1. 初始化网络栈
-	opts := stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
-	}
-	s := stack.New(opts) // s 是 *stack.Stack
+func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
+	log.Printf("[Stack] 启动中 (FD: %d, MTU: %d, Type: %s)", fd, mtu, cfg.Type)
 
-	// 2. 创建 TUN 设备 (传入 MTU 1500)
-	dev, err := NewDevice(fd, 1500)
+	dev, err := NewDevice(fd, uint32(mtu))
 	if err != nil {
-		return nil, fmt.Errorf("创建 TUN 设备失败: %v", err)
+		return nil, err
 	}
+
+	s := stack.New(stack.Options{
+		NetworkProtocols: []stack.NetworkProtocolFactory{
+			ipv4.NewProtocol,
+			ipv6.NewProtocol,
+		},
+		TransportProtocols: []stack.TransportProtocolFactory{
+			tcp.NewProtocol,
+			udp.NewProtocol,
+		},
+	})
+
+	s.SetForwardingDefaultAndAllNICs(ipv4.ProtocolNumber, true)
+	s.SetForwardingDefaultAndAllNICs(ipv6.ProtocolNumber, true)
+
+	nicID := tcpip.NICID(1)
+
+	if err := s.CreateNIC(nicID, dev.LinkEndpoint()); err != nil {
+		dev.Close()
+		return nil, fmt.Errorf("创建网卡失败: %v", err)
+	}
+
+	s.SetPromiscuousMode(nicID, true)
+	s.SetSpoofing(nicID, true)
+
+	s.SetRouteTable([]tcpip.Route{
+		{Destination: header.IPv4EmptySubnet, NIC: nicID},
+		{Destination: header.IPv6EmptySubnet, NIC: nicID},
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	dialer := proxy.NewDialer(cfg)
 
-	st := &Stack{
+	tStack := &Stack{
 		stack:  s,
 		device: dev,
 		dialer: dialer,
@@ -67,46 +90,32 @@ func StartStack(fd int, cfg *config.OutboundConfig) (*Stack, error) {
 		cancel: cancel,
 	}
 
-	// 3. 创建 NIC
-	nicID := tcpip.NICID(1)
-	if err := s.CreateNIC(nicID, dev); err != nil {
-		return nil, fmt.Errorf("CreateNIC 失败: %v", err)
-	}
-
-	// 4. 设置路由表
-	s.SetRouteTable([]tcpip.Route{
-		{
-			Destination: header.IPv4EmptySubnet,
-			NIC:         nicID,
-		},
-		{
-			Destination: header.IPv6EmptySubnet,
-			NIC:         nicID,
-		},
-	})
-
-	// 5. 设置传输层处理
-	// [注意] NewForwarder 第一个参数需要 *stack.Stack
-	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcp.NewForwarder(s, 0, 10, st.handleTCP).HandlePacket)
-	s.SetTransportProtocolHandler(udp.ProtocolNumber, udp.NewForwarder(s, st.handleUDP).HandlePacket)
-
-	log.Println("GoLog: 网络栈启动完成")
-	return st, nil
+	tStack.startPacketHandling()
+	return tStack, nil
 }
 
-// handleTCP 处理 TCP 流量
+func (s *Stack) startPacketHandling() {
+	tcpHandler := tcp.NewForwarder(s.stack, 30000, 10, func(r *tcp.ForwarderRequest) {
+		go s.handleTCP(r)
+	})
+	s.stack.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpHandler.HandlePacket)
+
+	udpHandler := udp.NewForwarder(s.stack, func(r *udp.ForwarderRequest) {
+		s.handleUDP(r)
+	})
+	s.stack.SetTransportProtocolHandler(udp.ProtocolNumber, udpHandler.HandlePacket)
+}
+
 func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	defer func() {
 		if err := recover(); err != nil {
-			log.Printf("[TCP] Panic 恢复: %v", err)
+			log.Printf("[TCP] Panic: %v", err)
 		}
 	}()
 
 	id := r.ID()
-	targetHost := id.LocalAddress.String()
-	targetPort := int(id.LocalPort)
 
-	// 连接远程代理
+	// 1. 拨号代理
 	remoteConn, dialErr := s.dialer.Dial()
 	if dialErr != nil {
 		r.Complete(true)
@@ -114,26 +123,28 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	}
 	defer remoteConn.Close()
 
-	// 握手
+	// 2. 握手
 	var payload []byte
 	var hErr error
+	targetHost := id.LocalAddress.String()
+	targetPort := int(id.LocalPort)
 	isVless := false
 
 	switch strings.ToLower(s.config.Type) {
 	case "mandala":
 		client := protocol.NewMandalaClient(s.config.Username, s.config.Password)
-		noiseSize := 0
-		if s.config.Settings != nil && s.config.Settings.Noise {
-			noiseSize = s.config.Settings.NoiseSize
-		}
-		payload, hErr = client.BuildHandshakePayload(targetHost, targetPort, noiseSize)
+		payload, hErr = client.BuildHandshakePayload(targetHost, targetPort)
 	case "trojan":
 		payload, hErr = protocol.BuildTrojanPayload(s.config.Password, targetHost, targetPort)
 	case "vless":
 		payload, hErr = protocol.BuildVlessPayload(s.config.UUID, targetHost, targetPort)
 		isVless = true
+
+	// [新增] Shadowsocks
 	case "shadowsocks":
 		payload, hErr = protocol.BuildShadowsocksPayload(targetHost, targetPort)
+
+	// [新增] SOCKS5 (交互式握手，无 Payload 生成)
 	case "socks", "socks5":
 		hErr = protocol.HandshakeSocks5(remoteConn, s.config.Username, s.config.Password, targetHost, targetPort)
 	}
@@ -143,6 +154,7 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 		return
 	}
 
+	// 发送握手包 (适用于 Mandala, Trojan, Vless, Shadowsocks)
 	if len(payload) > 0 {
 		if _, err := remoteConn.Write(payload); err != nil {
 			r.Complete(true)
@@ -150,11 +162,12 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 		}
 	}
 
+	// 如果是 VLESS，应用响应头剥离器
 	if isVless {
 		remoteConn = protocol.NewVlessConn(remoteConn)
 	}
 
-	// 创建本地端点
+	// 3. 建立本地连接
 	var wq waiter.Queue
 	ep, err := r.CreateEndpoint(&wq)
 	if err != nil {
@@ -166,7 +179,7 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	localConn := gonet.NewTCPConn(&wq, ep)
 	defer localConn.Close()
 
-	// 双向转发
+	// 4. 双向转发
 	go func() {
 		io.Copy(localConn, remoteConn)
 		localConn.CloseWrite()
@@ -175,10 +188,24 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	io.Copy(remoteConn, localConn)
 }
 
-// handleUDP 处理 UDP 流量
 func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 	id := r.ID()
-	dstPort := id.LocalPort
+	targetPort := int(id.LocalPort)
+
+	// [DNS处理] 拦截 53 端口
+	if targetPort == 53 {
+		var wq waiter.Queue
+		ep, err := r.CreateEndpoint(&wq)
+		if err != nil {
+			return
+		}
+		localConn := gonet.NewUDPConn(s.stack, &wq, ep)
+		go s.handleRemoteDNS(localConn)
+		return
+	}
+
+	targetIP := net.IP(id.LocalAddress.AsSlice()).String()
+	srcKey := fmt.Sprintf("%s:%d->%s:%d", id.RemoteAddress.String(), id.RemotePort, targetIP, targetPort)
 
 	var wq waiter.Queue
 	ep, err := r.CreateEndpoint(&wq)
@@ -186,37 +213,32 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 		return
 	}
 
-	// [修复] gonet.NewUDPConn 需要传入 gvisor stack 实例
 	localConn := gonet.NewUDPConn(s.stack, &wq, ep)
 
-	if dstPort == 53 {
-		go s.handleRemoteDNS(localConn)
-		return
-	}
-
-	targetIP := id.LocalAddress.String()
-	targetPort := int(dstPort)
-	key := fmt.Sprintf("%s:%d", targetIP, targetPort)
-
-	session, errNat := s.nat.GetOrCreate(key, localConn, targetIP, targetPort)
-	if errNat != nil {
+	// UDP NAT 逻辑
+	session, natErr := s.nat.GetOrCreate(srcKey, localConn, targetIP, targetPort)
+	if natErr != nil {
 		localConn.Close()
 		return
 	}
 
+	// Local -> Remote 转发
 	go func() {
+		defer localConn.Close()
 		buf := make([]byte, 4096)
 		for {
-			n, err := localConn.Read(buf)
-			if err != nil {
+			localConn.SetDeadline(time.Now().Add(60 * time.Second))
+			n, rErr := localConn.Read(buf)
+			if rErr != nil {
 				return
 			}
-			session.RemoteConn.Write(buf[:n])
+			if _, wErr := session.RemoteConn.Write(buf[:n]); wErr != nil {
+				return
+			}
 		}
 	}()
 }
 
-// handleRemoteDNS 处理 DNS
 func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
@@ -227,42 +249,51 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 		return
 	}
 
+	// 1. 连接代理
 	proxyConn, err := s.dialer.Dial()
 	if err != nil {
+		log.Printf("[DNS] 代理连接失败: %v", err)
 		return
 	}
 	defer proxyConn.Close()
 
+	// 2. 发送握手
 	var payload []byte
 	isVless := false
 
 	switch strings.ToLower(s.config.Type) {
 	case "mandala":
 		client := protocol.NewMandalaClient(s.config.Username, s.config.Password)
-		noiseSize := 0
-		if s.config.Settings != nil && s.config.Settings.Noise {
-			noiseSize = s.config.Settings.NoiseSize
-		}
-		payload, _ = client.BuildHandshakePayload("8.8.8.8", 53, noiseSize)
+		payload, _ = client.BuildHandshakePayload("8.8.8.8", 53)
 	case "trojan":
 		payload, _ = protocol.BuildTrojanPayload(s.config.Password, "8.8.8.8", 53)
 	case "vless":
 		payload, _ = protocol.BuildVlessPayload(s.config.UUID, "8.8.8.8", 53)
 		isVless = true
+
+	// [新增] Shadowsocks
 	case "shadowsocks":
 		payload, _ = protocol.BuildShadowsocksPayload("8.8.8.8", 53)
+
+	// [新增] SOCKS5
 	case "socks", "socks5":
-		protocol.HandshakeSocks5(proxyConn, s.config.Username, s.config.Password, "8.8.8.8", 53)
+		if err := protocol.HandshakeSocks5(proxyConn, s.config.Username, s.config.Password, "8.8.8.8", 53); err != nil {
+			log.Printf("[DNS] Socks5握手失败: %v", err)
+			return
+		}
 	}
 
 	if len(payload) > 0 {
-		proxyConn.Write(payload)
+		if _, err := proxyConn.Write(payload); err != nil {
+			return
+		}
 	}
 
 	if isVless {
 		proxyConn = protocol.NewVlessConn(proxyConn)
 	}
 
+	// 3. 封装 DNS
 	reqData := make([]byte, 2+n)
 	reqData[0] = byte(n >> 8)
 	reqData[1] = byte(n)
@@ -272,6 +303,7 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 		return
 	}
 
+	// 4. 读取响应
 	lenBuf := make([]byte, 2)
 	if _, err := io.ReadFull(proxyConn, lenBuf); err != nil {
 		return
@@ -283,18 +315,29 @@ func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
 		return
 	}
 
+	// 5. 写回 Android
 	conn.Write(respBuf)
+	log.Printf("[DNS] 解析完成")
 }
 
-func (s *Stack) Close() error {
-	s.cancel()
+func (s *Stack) Close() {
 	s.closeOnce.Do(func() {
-		if s.stack != nil {
-			s.stack.Close()
+		log.Println("[Stack] Stopping...")
+
+		if s.cancel != nil {
+			s.cancel()
 		}
+
+		time.Sleep(100 * time.Millisecond)
+
 		if s.device != nil {
 			s.device.Close()
 		}
+
+		if s.stack != nil {
+			s.stack.Close()
+		}
+
+		log.Println("[Stack] Stopped.")
 	})
-	return nil
 }
