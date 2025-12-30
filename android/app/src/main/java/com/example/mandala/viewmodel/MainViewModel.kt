@@ -36,6 +36,10 @@ data class AppStrings(
     val protocolSettings: String,
     val tlsFragment: String, val tlsFragmentDesc: String,
     val randomPadding: String, val randomPaddingDesc: String,
+    // [新增] ECH 相关文本
+    val echSettings: String, val enableEch: String, val enableEchDesc: String,
+    val echPublicName: String, val echDoH: String,
+    
     val localPort: String,
     val enableLogging: String,
     val enableLoggingDesc: String,
@@ -62,6 +66,10 @@ val ChineseStrings = AppStrings(
     protocolSettings = "协议参数 (核心)",
     tlsFragment = "TLS 分片", tlsFragmentDesc = "拆分 TLS 记录以绕过 DPI 检测",
     randomPadding = "随机填充", randomPaddingDesc = "向数据包添加随机噪音",
+    // [新增] ECH 中文
+    echSettings = "ECH (加密 Client Hello)", enableEch = "启用 ECH", enableEchDesc = "加密握手信息，防止 SNI 嗅探",
+    echPublicName = "公共名称 (Public Name)", echDoH = "DoH 服务器 (用于获取密钥)",
+    
     localPort = "本地监听端口",
     enableLogging = "启用日志记录",
     enableLoggingDesc = "将核心运行日志保存到本地文件以便调试",
@@ -88,6 +96,10 @@ val EnglishStrings = AppStrings(
     protocolSettings = "Protocol",
     tlsFragment = "TLS Fragment", tlsFragmentDesc = "Split TLS records to bypass DPI",
     randomPadding = "Random Padding", randomPaddingDesc = "Add random noise to packets",
+    // [新增] ECH 英文
+    echSettings = "ECH Settings", enableEch = "Enable ECH", enableEchDesc = "Encrypt handshake to hide SNI",
+    echPublicName = "Public Name", echDoH = "DoH Server URL",
+    
     localPort = "Local Port",
     enableLogging = "Enable Logging",
     enableLoggingDesc = "Save core logs to local file for debugging",
@@ -167,6 +179,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _randomPadding = MutableStateFlow(prefs.getBoolean("random_padding", false))
     val randomPadding = _randomPadding.asStateFlow()
 
+    // [新增] ECH 状态
+    private val _enableEch = MutableStateFlow(prefs.getBoolean("enable_ech", false))
+    val enableEch = _enableEch.asStateFlow()
+
+    private val _echPublicName = MutableStateFlow(prefs.getString("ech_public_name", "cloudflare-ech.com") ?: "")
+    val echPublicName = _echPublicName.asStateFlow()
+
+    private val _echDoH = MutableStateFlow(prefs.getString("ech_doh_url", "https://1.1.1.1/dns-query") ?: "")
+    val echDoH = _echDoH.asStateFlow()
+
     private val _localPort = MutableStateFlow(prefs.getInt("local_port", 10809))
     val localPort = _localPort.asStateFlow()
 
@@ -210,6 +232,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             "tls_fragment" -> _tlsFragment.value = value
             "random_padding" -> _randomPadding.value = value
             "logging_enabled" -> _loggingEnabled.value = value
+            "enable_ech" -> _enableEch.value = value // [新增]
+        }
+    }
+
+    // [新增] 更新字符串类型的设置
+    fun updateStringSetting(key: String, value: String) {
+        prefs.edit().putString(key, value).apply()
+        when (key) {
+            "ech_public_name" -> _echPublicName.value = value
+            "ech_doh_url" -> _echDoH.value = value
         }
     }
 
@@ -504,6 +536,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (logDir != null) File(logDir, "mandala_core.log").absolutePath 
             else getApplication<Application>().filesDir.absolutePath + "/mandala_core.log"
         } else ""
+        
+        // [修改] 注入 ECH 字段到 JSON
         return """
         {
             "tag": "${node.tag}",
@@ -514,7 +548,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             "uuid": "${node.uuid}",
             "username": "${if(node.protocol == "socks5") node.uuid else ""}",
             "log_path": "$logPath",
-            "tls": { "enabled": $useTls, "server_name": "${if (node.sni.isEmpty()) node.server else node.sni}", "insecure": ${_allowInsecure.value} },
+            "tls": { 
+                "enabled": $useTls, 
+                "server_name": "${if (node.sni.isEmpty()) node.server else node.sni}", 
+                "insecure": ${_allowInsecure.value},
+                "enable_ech": ${_enableEch.value},
+                "ech_public_name": "${_echPublicName.value}",
+                "ech_doh_url": "${_echDoH.value}"
+            },
             "transport": { "type": "${node.transport}", "path": "${node.path}" },
             "settings": { "vpn_mode": ${_vpnMode.value}, "fragment": ${_tlsFragment.value}, "noise": ${_randomPadding.value} },
             "local_port": ${_localPort.value}
