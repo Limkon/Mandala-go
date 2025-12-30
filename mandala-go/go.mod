@@ -8,13 +8,16 @@ require (
 	golang.org/x/mod v0.14.0 // 间接依赖
 	golang.org/x/tools v0.16.0 // 间接依赖
 
-	// [新增] 引入 miekg/dns 用于解析 ECH
+	// [新增] 专业的 WebSocket 库 (支持 HTTP/2)
+	github.com/coder/websocket v1.8.12
+
+	// DNS 解析
 	github.com/miekg/dns v1.1.62
 	
-	// ECH 握手库
+	// ECH 握手
 	github.com/refraction-networking/utls v1.6.7
 	
-	// 移除旧的 dnsmessage 依赖，保留 net 用于其他网络功能
+	// 网络库
 	golang.org/x/net v0.27.0
 
 	// 项目依赖
