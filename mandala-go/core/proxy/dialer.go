@@ -149,9 +149,9 @@ func resolveECHConfig(ctx context.Context, dohURL string, domain string) ([]byte
 	for _, ans := range respMsg.Answer {
 		if https, ok := ans.(*dns.HTTPS); ok {
 			for _, val := range https.Value {
-				// miekg/dns 库将 Key=5 解析为 SVCBECH 类型
-				if ech, ok := val.(*dns.SVCBECH); ok {
-					return ech.Config, nil
+				// [关键修改] 使用正确的类型名称 SVCBECHConfig
+				if ech, ok := val.(*dns.SVCBECHConfig); ok {
+					return ech.ECH, nil
 				}
 			}
 		}
