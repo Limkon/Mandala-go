@@ -16,12 +16,12 @@ import (
 
 	"mandala/core/config"
 
+	"github.com/miekg/dns"
 	utls "github.com/refraction-networking/utls"
-	"golang.org/x/net/dns/dnsmessage"
 )
 
 func init() {
-	// 初始化随机数种子。
+	// 初始化随机数种子
 	rand.Seed(time.Now().UnixNano())
 }
 
@@ -44,29 +44,25 @@ func (d *Dialer) Dial() (net.Conn, error) {
 		// [Step 1] 准备 ECH 配置
 		var echConfigList []byte
 		if d.Config.TLS.EnableECH && d.Config.TLS.ECHDoHURL != "" && d.Config.TLS.ECHPublicName != "" {
-			// 尝试解析 ECH 配置
-			// 注意：生产环境建议添加缓存机制，避免每次连接都进行 DNS 查询
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			// 使用带超时的 Context 防止 DNS 查询卡死
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			configs, err := resolveECHConfig(ctx, d.Config.TLS.ECHDoHURL, d.Config.TLS.ECHPublicName)
 			cancel()
-			
+
 			if err == nil && len(configs) > 0 {
 				echConfigList = configs
 				// fmt.Println("[ECH] Config fetched successfully")
 			} else {
-				// ECH 获取失败，可以选择降级或报错。这里选择降级为普通 TLS，但打印日志
 				fmt.Printf("[ECH] Warning: Fetch failed for %s: %v. Fallback to standard TLS.\n", d.Config.TLS.ECHPublicName, err)
 			}
 		}
 
 		// [Step 2] 构建 uTLS 配置
-		// uTLS 的 Config 结构体尽量兼容标准库，但多了 ECH 字段
 		uTlsConfig := &utls.Config{
 			ServerName:         d.Config.TLS.ServerName,
 			InsecureSkipVerify: d.Config.TLS.Insecure,
 			MinVersion:         tls.VersionTLS12,
-			
-			// 填入解析到的 ECH 密钥 (如果为空，uTLS 会自动忽略，行为等同于普通 TLS)
+			// 填入解析到的 ECH 密钥 (如果为空，uTLS 会自动忽略)
 			EncryptedClientHelloConfigList: echConfigList,
 		}
 
@@ -74,19 +70,18 @@ func (d *Dialer) Dial() (net.Conn, error) {
 			uTlsConfig.ServerName = d.Config.Server
 		}
 
-		// [Step 3] 处理分片 (Fragment)
-		// 即使使用 uTLS，底层的 FragmentConn 依然有效，用于在 TCP 层拆分 ClientHello
+		// [Step 3] 处理分片 (Fragment) 与握手
 		var uConn *utls.UConn
 		if d.Config.Settings.Fragment {
+			// 启用分片，底层连接包裹 FragmentConn
 			fragmentConn := &FragmentConn{Conn: conn, active: true}
-			// 使用 uTLS 包装分片连接
-			// HelloChrome_Auto 模拟 Chrome 指纹，这是 ECH 能够成功伪装的关键
+			// HelloChrome_Auto 模拟 Chrome 指纹
 			uConn = utls.UClient(fragmentConn, uTlsConfig, utls.HelloChrome_Auto)
 		} else {
 			uConn = utls.UClient(conn, uTlsConfig, utls.HelloChrome_Auto)
 		}
 
-		// [Step 4] 执行握手
+		// 执行握手 (uTLS 会自动处理 ECH 扩展注入)
 		if err := uConn.Handshake(); err != nil {
 			conn.Close()
 			return nil, fmt.Errorf("utls handshake failed: %v", err)
@@ -94,7 +89,7 @@ func (d *Dialer) Dial() (net.Conn, error) {
 		conn = uConn
 	}
 
-	// [Step 5] WebSocket 处理 (保持原有逻辑不变)
+	// [Step 4] WebSocket 处理
 	if d.Config.Transport != nil && d.Config.Transport.Type == "ws" {
 		wsConn, err := d.handshakeWebSocket(conn)
 		if err != nil {
@@ -107,39 +102,27 @@ func (d *Dialer) Dial() (net.Conn, error) {
 	return conn, nil
 }
 
-// resolveECHConfig 通过 DoH 获取 HTTPS 记录中的 ECH 配置
+// resolveECHConfig 使用 miekg/dns 解析 DoH 响应并提取 ECH 配置
 func resolveECHConfig(ctx context.Context, dohURL string, domain string) ([]byte, error) {
 	// 1. 构造 DNS 查询 (Type 65 - HTTPS)
-	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
-		ID:                 0,
-		Response:           false,
-		OpCode:             0,
-		Authoritative:      false,
-		Truncated:          false,
-		RecursionDesired:   true,
-		RecursionAvailable: false,
-		RCode:              0,
-	})
-	b.StartQuestions()
-	b.Question(dnsmessage.Question{
-		Name:  dnsmessage.MustNewName(domain + "."),
-		Type:  65, // TypeHTTPS
-		Class: dnsmessage.ClassINET,
-	})
-	msg, err := b.Finish()
+	msg := new(dns.Msg)
+	msg.SetQuestion(dns.Fqdn(domain), dns.TypeHTTPS)
+	
+	// 转换为 wire format
+	data, err := msg.Pack()
 	if err != nil {
 		return nil, err
 	}
 
 	// 2. 发送 DoH 请求
-	req, err := http.NewRequestWithContext(ctx, "POST", dohURL, strings.NewReader(string(msg)))
+	req, err := http.NewRequestWithContext(ctx, "POST", dohURL, strings.NewReader(string(data)))
 	if err != nil {
 		return nil, err
 	}
+	// 设置标准 DoH Header
 	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("Accept", "application/dns-message")
 
-	// 使用短超时的 Client
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -157,64 +140,43 @@ func resolveECHConfig(ctx context.Context, dohURL string, domain string) ([]byte
 	}
 
 	// 3. 解析 DNS 响应
-	var p dnsmessage.Parser
-	if _, err := p.Start(body); err != nil {
-		return nil, err
-	}
-	if err := p.SkipAllQuestions(); err != nil {
+	respMsg := new(dns.Msg)
+	if err := respMsg.Unpack(body); err != nil {
 		return nil, err
 	}
 
-	for {
-		h, err := p.AnswerHeader()
-		if err == dnsmessage.ErrSectionDone {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-
-		if h.Type == 65 { // HTTPS
-			r, err := p.HTTPSResource()
-			if err != nil {
-				// 解析资源体失败，跳过
-				if err := p.SkipAnswer(); err != nil {
-					return nil, err
-				}
-				continue
-			}
-			
-			// 遍历 Key-Value 对，寻找 ech (key=5)
-			for _, val := range r.Values {
-				if val.Key == 5 {
-					return val.Value, nil
+	// 4. 遍历 Answer 提取 ECH
+	for _, ans := range respMsg.Answer {
+		if https, ok := ans.(*dns.HTTPS); ok {
+			for _, val := range https.Value {
+				// miekg/dns 库将 Key=5 解析为 SVCBECH 类型
+				if ech, ok := val.(*dns.SVCBECH); ok {
+					return ech.Config, nil
 				}
 			}
-		}
-
-		if err := p.SkipAnswer(); err != nil {
-			return nil, err
 		}
 	}
 
 	return nil, fmt.Errorf("no ECH config found")
 }
 
-// FragmentConn 用于在 TLS 握手初期拆分数据包 (保持原有逻辑)
+// FragmentConn 用于在 TLS 握手初期拆分数据包
 type FragmentConn struct {
 	net.Conn
 	active bool
 }
 
 func (f *FragmentConn) Write(b []byte) (int, error) {
-	// uTLS 的 ClientHello 依然符合 TLS 记录层格式 (0x16 开头)
+	// 0x16 是 TLS Handshake 记录头的标志
 	if f.active && len(b) > 50 && b[0] == 0x16 {
 		f.active = false
+		// 随机切分位置
 		cut := 5 + rand.Intn(10)
 		n1, err := f.Conn.Write(b[:cut])
 		if err != nil {
 			return n1, err
 		}
+		// 短暂睡眠增加混淆效果
 		time.Sleep(time.Duration(rand.Intn(5)) * time.Millisecond)
 		n2, err := f.Conn.Write(b[cut:])
 		return n1 + n2, err
@@ -222,6 +184,7 @@ func (f *FragmentConn) Write(b []byte) (int, error) {
 	return f.Conn.Write(b)
 }
 
+// handshakeWebSocket 执行 WebSocket 握手
 func (d *Dialer) handshakeWebSocket(conn net.Conn) (net.Conn, error) {
 	path := d.Config.Transport.Path
 	if path == "" {
@@ -266,6 +229,7 @@ func (d *Dialer) handshakeWebSocket(conn net.Conn) (net.Conn, error) {
 	return NewWSConn(conn, br), nil
 }
 
+// WSConn 封装 WebSocket 数据帧的读写
 type WSConn struct {
 	net.Conn
 	reader    *bufio.Reader
@@ -302,6 +266,7 @@ func (w *WSConn) Write(b []byte) (int, error) {
 	payloadStart := len(buf)
 	buf = append(buf, b...)
 
+	// 客户端发送必须掩码处理
 	for i := 0; i < length; i++ {
 		buf[payloadStart+i] ^= maskKey[i%4]
 	}
@@ -357,20 +322,21 @@ func (w *WSConn) Read(b []byte) (int, error) {
 		}
 
 		if masked {
+			// 如果服务器发来掩码数据（不常见），读取掩码并丢弃
 			if _, err := io.CopyN(io.Discard, w.reader, 4); err != nil {
 				return 0, err
 			}
 		}
 
 		switch opcode {
-		case 0x8:
+		case 0x8: // Close Frame
 			return 0, io.EOF
-		case 0x9, 0xA:
+		case 0x9, 0xA: // Ping/Pong
 			if payloadLen > 0 {
 				io.CopyN(io.Discard, w.reader, payloadLen)
 			}
 			continue
-		case 0x0, 0x1, 0x2:
+		case 0x0, 0x1, 0x2: // Continuation, Text, Binary
 			w.remaining = payloadLen
 			if w.remaining == 0 {
 				continue
