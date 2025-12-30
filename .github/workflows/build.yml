@@ -55,8 +55,9 @@ jobs:
         run: |
           echo "Building Mandala Core..."
           
-          # [关键修复] 强制获取最新版依赖以支持 ECH 和 HTTPS 记录
+          # [关键修复] 强制获取最新依赖以支持 ECH (utls) 和 DNS 解析 (miekg/dns)
           go get github.com/refraction-networking/utls@master
+          go get github.com/miekg/dns@latest
           go get golang.org/x/net@latest
           
           go mod tidy
