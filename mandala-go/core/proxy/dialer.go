@@ -40,12 +40,14 @@ func (d *Dialer) Dial() (net.Conn, error) {
 	}
 
 	// 2. 准备 TLS/uTLS 连接
-	var uConn *utls.UConn
+	// 标记是否已经完成了 TLS 握手
+	isTLSEstablished := false
+	
 	if d.Config.TLS != nil && d.Config.TLS.Enabled {
 		// [ECH] 获取配置
 		var echConfigList []byte
 		if d.Config.TLS.EnableECH && d.Config.TLS.ECHDoHURL != "" && d.Config.TLS.ECHPublicName != "" {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second) // 缩短超时防止卡顿
 			configs, err := resolveECHConfig(ctx, d.Config.TLS.ECHDoHURL, d.Config.TLS.ECHPublicName)
 			cancel()
 
@@ -60,8 +62,7 @@ func (d *Dialer) Dial() (net.Conn, error) {
 			ServerName:         d.Config.TLS.ServerName,
 			InsecureSkipVerify: d.Config.TLS.Insecure,
 			MinVersion:         tls.VersionTLS12,
-			// 显式声明只支持 http/1.1 (虽然会被 HelloCustom 覆盖，但作为兜底)
-			NextProtos:                     []string{"http/1.1"},
+			NextProtos:         []string{"http/1.1"},
 			EncryptedClientHelloConfigList: echConfigList,
 		}
 
@@ -74,55 +75,53 @@ func (d *Dialer) Dial() (net.Conn, error) {
 			conn = &FragmentConn{Conn: conn, active: true}
 		}
 
-		// [关键修改] 使用 HelloCustom 模式，以便我们可以手动修补指纹
-		uConn = utls.UClient(conn, uTlsConfig, utls.HelloCustom)
+		uConn := utls.UClient(conn, uTlsConfig, utls.HelloCustom)
 
-		// 1. 获取 Chrome 浏览器的默认指纹模版
-		// [修复] 使用 UTLSIdToSpec 获取 Spec，而不是调用不存在的方法
+		// 1. 获取 Chrome 指纹
 		spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
 		if err != nil {
 			conn.Close()
 			return nil, fmt.Errorf("failed to get uTLS spec: %v", err)
 		}
 
-		// 2. 遍历指纹中的扩展，找到 ALPN 扩展
+		// 2. 强制 ALPN 为 http/1.1
 		foundALPN := false
 		for i, ext := range spec.Extensions {
 			if alpn, ok := ext.(*utls.ALPNExtension); ok {
-				// 3. [核心操作] 强制将其修改为只支持 http/1.1
-				// 这会告诉服务器：“我虽然是 Chrome，但我这次只想用 HTTP/1.1”
-				// 这样服务器就不会发送 HTTP/2 数据，也就不会触发 "invalid Upgrade header" 错误
 				alpn.AlpnProtocols = []string{"http/1.1"}
 				spec.Extensions[i] = alpn
 				foundALPN = true
 				break
 			}
 		}
-
-		// 如果原指纹没 ALPN (防御性编程)，补一个
 		if !foundALPN {
 			spec.Extensions = append(spec.Extensions, &utls.ALPNExtension{AlpnProtocols: []string{"http/1.1"}})
 		}
 
-		// 4. 应用修补后的指纹
 		if err := uConn.ApplyPreset(&spec); err != nil {
 			conn.Close()
 			return nil, fmt.Errorf("apply preset failed: %v", err)
 		}
 
-		// 执行 TLS 握手
 		if err := uConn.Handshake(); err != nil {
 			conn.Close()
 			return nil, fmt.Errorf("utls handshake failed: %v", err)
 		}
 		
 		conn = uConn
+		isTLSEstablished = true
 	}
 
 	// 3. 处理 WebSocket
 	if d.Config.Transport != nil && d.Config.Transport.Type == "ws" {
+		// [关键修复]
+		// 如果我们已经在上方手动完成了 TLS 握手 (isTLSEstablished == true)，
+		// 这里的 scheme 必须是 "ws" 而不是 "wss"。
+		// 因为 conn 已经是加密连接，websocket 库只需要写入明文 HTTP Upgrade 请求即可。
+		// 如果传 "wss"，库会尝试再次进行 TLS 握手，导致 "server gave HTTP response to HTTPS client" 错误。
 		scheme := "ws"
-		if d.Config.TLS != nil && d.Config.TLS.Enabled {
+		if d.Config.TLS != nil && d.Config.TLS.Enabled && !isTLSEstablished {
+			// 只有在没手动处理 TLS 的情况下，才让 websocket 库处理 wss
 			scheme = "wss"
 		}
 		
@@ -130,10 +129,14 @@ func (d *Dialer) Dial() (net.Conn, error) {
 		if path == "" {
 			path = "/"
 		}
+		
+		// Host 头用于服务器路由，必须正确
 		host := d.Config.TLS.ServerName
 		if host == "" {
 			host = d.Config.Server
 		}
+		
+		// 这里的 wsURL 只是给库解析用的，实际上数据走的是 DialContext 返回的 conn
 		wsURL := fmt.Sprintf("%s://%s%s", scheme, host, path)
 
 		headers := make(http.Header)
@@ -142,12 +145,13 @@ func (d *Dialer) Dial() (net.Conn, error) {
 				headers.Set(k, v)
 			}
 		}
+		// 确保 Host 头存在
+		headers.Set("Host", host)
 
-		// 使用标准 http.Transport，因为我们强制了 HTTP/1.1
-		// 这样最稳定，兼容性最好
 		httpClient := &http.Client{
 			Transport: &http.Transport{
 				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					// 直接返回已经建立好的（可能是加密的）连接
 					return conn, nil
 				},
 			},
@@ -162,7 +166,6 @@ func (d *Dialer) Dial() (net.Conn, error) {
 			CompressionMode: websocket.CompressionDisabled,
 		}
 
-		// 依然使用 coder/websocket 库，因为它处理分片和协议细节更专业
 		wsConn, _, err := websocket.Dial(ctx, wsURL, opts)
 		if err != nil {
 			conn.Close()
