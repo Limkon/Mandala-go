@@ -38,6 +38,10 @@ type Stack struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	closeOnce sync.Once
+
+	// [优化] DNS 连接复用
+	dnsMu   sync.Mutex
+	dnsConn net.Conn
 }
 
 func StartStack(fd int, mtu int, cfg *config.OutboundConfig) (*Stack, error) {
@@ -121,9 +125,9 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 		r.Complete(true)
 		return
 	}
-	defer remoteConn.Close()
+	// [修复] 不再依赖简单的 defer remoteConn.Close()，而是通过 closeAll 统一管理
 
-	// 2. 握手
+	// 2. 握手逻辑 (保持不变)
 	var payload []byte
 	var hErr error
 	targetHost := id.LocalAddress.String()
@@ -133,37 +137,32 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	switch strings.ToLower(s.config.Type) {
 	case "mandala":
 		client := protocol.NewMandalaClient(s.config.Username, s.config.Password)
-		// [修改] 传入 Noise 配置
 		payload, hErr = client.BuildHandshakePayload(targetHost, targetPort, s.config.Settings.Noise)
 	case "trojan":
 		payload, hErr = protocol.BuildTrojanPayload(s.config.Password, targetHost, targetPort)
 	case "vless":
 		payload, hErr = protocol.BuildVlessPayload(s.config.UUID, targetHost, targetPort)
 		isVless = true
-
-	// [新增] Shadowsocks
 	case "shadowsocks":
 		payload, hErr = protocol.BuildShadowsocksPayload(targetHost, targetPort)
-
-	// [新增] SOCKS5 (交互式握手，无 Payload 生成)
 	case "socks", "socks5":
 		hErr = protocol.HandshakeSocks5(remoteConn, s.config.Username, s.config.Password, targetHost, targetPort)
 	}
 
 	if hErr != nil {
+		remoteConn.Close()
 		r.Complete(true)
 		return
 	}
 
-	// 发送握手包 (适用于 Mandala, Trojan, Vless, Shadowsocks)
 	if len(payload) > 0 {
 		if _, err := remoteConn.Write(payload); err != nil {
+			remoteConn.Close()
 			r.Complete(true)
 			return
 		}
 	}
 
-	// 如果是 VLESS，应用响应头剥离器
 	if isVless {
 		remoteConn = protocol.NewVlessConn(remoteConn)
 	}
@@ -172,21 +171,32 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	var wq waiter.Queue
 	ep, err := r.CreateEndpoint(&wq)
 	if err != nil {
+		remoteConn.Close()
 		r.Complete(true)
 		return
 	}
 	r.Complete(false)
 
 	localConn := gonet.NewTCPConn(&wq, ep)
-	defer localConn.Close()
 
-	// 4. 双向转发
+	// [修复] 健壮的双向转发关闭逻辑
+	// 任何一端出错或结束，都确保两端 socket 被关闭
+	closeAll := func() {
+		localConn.Close()
+		remoteConn.Close()
+	}
+
 	go func() {
+		defer closeAll()
 		io.Copy(localConn, remoteConn)
-		localConn.CloseWrite()
+		// 远程读完(EOF)，通常意味着连接结束
 	}()
 
-	io.Copy(remoteConn, localConn)
+	go func() {
+		defer closeAll()
+		io.Copy(remoteConn, localConn)
+		// 本地读完(EOF)
+	}()
 }
 
 func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
@@ -216,14 +226,12 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 
 	localConn := gonet.NewUDPConn(s.stack, &wq, ep)
 
-	// UDP NAT 逻辑
 	session, natErr := s.nat.GetOrCreate(srcKey, localConn, targetIP, targetPort)
 	if natErr != nil {
 		localConn.Close()
 		return
 	}
 
-	// Local -> Remote 转发
 	go func() {
 		defer localConn.Close()
 		buf := make([]byte, 4096)
@@ -240,86 +248,109 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) {
 	}()
 }
 
-func (s *Stack) handleRemoteDNS(conn *gonet.UDPConn) {
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
-
+// [优化] handleRemoteDNS 复用连接
+func (s *Stack) handleRemoteDNS(localConn *gonet.UDPConn) {
+	defer localConn.Close()
+	
+	// 读取 Android 发来的 DNS 请求
+	localConn.SetDeadline(time.Now().Add(5 * time.Second))
 	buf := make([]byte, 1500)
-	n, err := conn.Read(buf)
+	n, err := localConn.Read(buf)
 	if err != nil {
 		return
 	}
 
-	// 1. 连接代理
-	proxyConn, err := s.dialer.Dial()
-	if err != nil {
-		log.Printf("[DNS] 代理连接失败: %v", err)
-		return
-	}
-	defer proxyConn.Close()
+	// 锁定 DNS 通道，确保同一时刻只有一个 DNS 请求在写入/读取，防止 TCP 流粘包
+	s.dnsMu.Lock()
+	defer s.dnsMu.Unlock()
 
-	// 2. 发送握手
-	var payload []byte
-	isVless := false
+	// 重试机制：如果 cached 连接已死，允许重连一次
+	for i := 0; i < 2; i++ {
+		// 1. 获取或建立连接
+		if s.dnsConn == nil {
+			// Dial
+			proxyConn, err := s.dialer.Dial()
+			if err != nil {
+				log.Printf("[DNS] 代理连接失败: %v", err)
+				return // 无法连接，直接丢弃
+			}
+			
+			// Handshake (Target: 8.8.8.8:53)
+			var payload []byte
+			isVless := false
+			
+			switch strings.ToLower(s.config.Type) {
+			case "mandala":
+				client := protocol.NewMandalaClient(s.config.Username, s.config.Password)
+				payload, _ = client.BuildHandshakePayload("8.8.8.8", 53, s.config.Settings.Noise)
+			case "trojan":
+				payload, _ = protocol.BuildTrojanPayload(s.config.Password, "8.8.8.8", 53)
+			case "vless":
+				payload, _ = protocol.BuildVlessPayload(s.config.UUID, "8.8.8.8", 53)
+				isVless = true
+			case "shadowsocks":
+				payload, _ = protocol.BuildShadowsocksPayload("8.8.8.8", 53)
+			case "socks", "socks5":
+				if err := protocol.HandshakeSocks5(proxyConn, s.config.Username, s.config.Password, "8.8.8.8", 53); err != nil {
+					proxyConn.Close()
+					log.Printf("[DNS] Socks5握手失败: %v", err)
+					return
+				}
+			}
 
-	switch strings.ToLower(s.config.Type) {
-	case "mandala":
-		client := protocol.NewMandalaClient(s.config.Username, s.config.Password)
-		// [修改] 传入 Noise 配置
-		payload, _ = client.BuildHandshakePayload("8.8.8.8", 53, s.config.Settings.Noise)
-	case "trojan":
-		payload, _ = protocol.BuildTrojanPayload(s.config.Password, "8.8.8.8", 53)
-	case "vless":
-		payload, _ = protocol.BuildVlessPayload(s.config.UUID, "8.8.8.8", 53)
-		isVless = true
+			if len(payload) > 0 {
+				if _, err := proxyConn.Write(payload); err != nil {
+					proxyConn.Close()
+					continue // 重试
+				}
+			}
 
-	// [新增] Shadowsocks
-	case "shadowsocks":
-		payload, _ = protocol.BuildShadowsocksPayload("8.8.8.8", 53)
-
-	// [新增] SOCKS5
-	case "socks", "socks5":
-		if err := protocol.HandshakeSocks5(proxyConn, s.config.Username, s.config.Password, "8.8.8.8", 53); err != nil {
-			log.Printf("[DNS] Socks5握手失败: %v", err)
-			return
+			if isVless {
+				proxyConn = protocol.NewVlessConn(proxyConn)
+			}
+			
+			s.dnsConn = proxyConn
 		}
-	}
 
-	if len(payload) > 0 {
-		if _, err := proxyConn.Write(payload); err != nil {
-			return
+		// 2. 封装 DNS 请求 (Length-Prefixed)
+		reqData := make([]byte, 2+n)
+		reqData[0] = byte(n >> 8)
+		reqData[1] = byte(n)
+		copy(reqData[2:], buf[:n])
+
+		s.dnsConn.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := s.dnsConn.Write(reqData); err != nil {
+			log.Printf("[DNS] 写入失败，重置连接: %v", err)
+			s.dnsConn.Close()
+			s.dnsConn = nil
+			continue // 连接可能断开，重试 loop (i=1)
 		}
-	}
 
-	if isVless {
-		proxyConn = protocol.NewVlessConn(proxyConn)
-	}
+		// 3. 读取响应长度
+		lenBuf := make([]byte, 2)
+		if _, err := io.ReadFull(s.dnsConn, lenBuf); err != nil {
+			log.Printf("[DNS] 读取长度失败: %v", err)
+			s.dnsConn.Close()
+			s.dnsConn = nil
+			continue
+		}
+		respLen := int(lenBuf[0])<<8 | int(lenBuf[1])
 
-	// 3. 封装 DNS
-	reqData := make([]byte, 2+n)
-	reqData[0] = byte(n >> 8)
-	reqData[1] = byte(n)
-	copy(reqData[2:], buf[:n])
+		// 4. 读取响应体
+		respBuf := make([]byte, respLen)
+		if _, err := io.ReadFull(s.dnsConn, respBuf); err != nil {
+			log.Printf("[DNS] 读取Body失败: %v", err)
+			s.dnsConn.Close()
+			s.dnsConn = nil
+			continue
+		}
 
-	if _, err := proxyConn.Write(reqData); err != nil {
+		// 5. 写回 Android (UDP)
+		localConn.Write(respBuf)
+		
+		// 成功，保持 dnsConn 不关闭，供下次使用
 		return
 	}
-
-	// 4. 读取响应
-	lenBuf := make([]byte, 2)
-	if _, err := io.ReadFull(proxyConn, lenBuf); err != nil {
-		return
-	}
-	respLen := int(lenBuf[0])<<8 | int(lenBuf[1])
-
-	respBuf := make([]byte, respLen)
-	if _, err := io.ReadFull(proxyConn, respBuf); err != nil {
-		return
-	}
-
-	// 5. 写回 Android
-	conn.Write(respBuf)
-	log.Printf("[DNS] 解析完成")
 }
 
 func (s *Stack) Close() {
@@ -329,6 +360,14 @@ func (s *Stack) Close() {
 		if s.cancel != nil {
 			s.cancel()
 		}
+		
+		// [优化] 关闭 DNS 缓存连接
+		s.dnsMu.Lock()
+		if s.dnsConn != nil {
+			s.dnsConn.Close()
+			s.dnsConn = nil
+		}
+		s.dnsMu.Unlock()
 
 		time.Sleep(100 * time.Millisecond)
 
