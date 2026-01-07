@@ -28,7 +28,8 @@ class MandalaVpnService : VpnService() {
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
-    // [修复] 增加运行状态标记，防止重复启动或停止
+    
+    @Volatile
     private var isRunning = false
 
     override fun onCreate() {
@@ -37,21 +38,20 @@ class MandalaVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            stopVpn()
-            return START_NOT_STICKY
+        when (intent?.action) {
+            ACTION_STOP -> {
+                stopVpn()
+                return START_NOT_STICKY
+            }
+            ACTION_START -> {
+                val config = intent.getStringExtra(EXTRA_CONFIG) ?: ""
+                if (config.isEmpty()) {
+                    stopVpn()
+                } else {
+                    startVpn(config)
+                }
+            }
         }
-
-        // 提升前台服务优先级
-        startForeground(NOTIFICATION_ID, createNotification("正在连接..."))
-
-        val config = intent?.getStringExtra(EXTRA_CONFIG) ?: ""
-        if (config.isEmpty()) {
-            stopVpn()
-            return START_NOT_STICKY
-        }
-
-        startVpn(config)
         return START_NOT_STICKY
     }
 
@@ -65,7 +65,7 @@ class MandalaVpnService : VpnService() {
                 description = "显示 VPN 连接状态"
             }
             val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
+            manager?.createNotificationChannel(channel)
         }
     }
 
@@ -80,18 +80,24 @@ class MandalaVpnService : VpnService() {
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
-            .setOnlyAlertOnce(true) // [优化] 防止状态更新时通知震动打扰
+            .setOnlyAlertOnce(true)
             .build()
     }
 
+    @Synchronized
     private fun startVpn(configJson: String) {
-        if (isRunning) return
-        isRunning = true
+        if (isRunning) {
+            android.util.Log.d("MandalaVpn", "VPN 已经在运行中，跳过重复启动")
+            return
+        }
 
         try {
-            // [优化] 如果之前有未关闭的接口，先关闭，防止 FD 泄露
-            if (vpnInterface != null) {
-                try { vpnInterface?.close() } catch (e: Exception) {}
+            // 提升为前台服务
+            startForeground(NOTIFICATION_ID, createNotification("正在初始化核心..."))
+
+            // 清理旧接口防止 FD 泄露
+            vpnInterface?.let {
+                try { it.close() } catch (e: Exception) {}
                 vpnInterface = null
             }
 
@@ -104,48 +110,54 @@ class MandalaVpnService : VpnService() {
                 .addDisallowedApplication(packageName)
                 .setSession("Mandala Core")
             
-            // Android 10+ 建议显式设置按流量计费状态
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 builder.setMetered(false)
             }
 
             vpnInterface = builder.establish()
-            
-            // 检查建立是否成功（如被其他 VPN 抢占）
             val fd = vpnInterface?.fd
+
             if (fd == null) {
+                android.util.Log.e("MandalaVpn", "无法建立 VPN 接口 (establish returned null)")
                 stopVpn()
                 return
             }
 
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.notify(NOTIFICATION_ID, createNotification("VPN 已连接"))
+            // 标记为运行中
+            isRunning = true
 
             // 启动 Go 核心
-            // 注意：fd 必须转换为 Long 传递
             val err = Mobile.startVpn(fd.toLong(), 1500L, configJson)
             if (err.isNotEmpty()) {
-                android.util.Log.e("MandalaVpn", "Core start failed: $err")
+                android.util.Log.e("MandalaVpn", "Go 核心启动失败: $err")
                 stopVpn()
+                return
             }
+
+            // 更新通知状态
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.notify(NOTIFICATION_ID, createNotification("VPN 已连接"))
+
         } catch (e: Exception) {
+            android.util.Log.e("MandalaVpn", "启动流程发生异常: ${e.message}")
             e.printStackTrace()
             stopVpn()
         }
     }
 
+    @Synchronized
     private fun stopVpn() {
+        if (!isRunning && vpnInterface == null) return
+        
         isRunning = false
         
         try {
-            // [修复] 确保 Mobile.stop() 被调用
             Mobile.stop()
         } catch (e: Exception) {
-            e.printStackTrace()
+            android.util.Log.e("MandalaVpn", "停止核心异常: ${e.message}")
         }
         
         try {
-            // [修复] 必须关闭文件描述符，否则下次启动可能会失败或内存泄露
             vpnInterface?.close()
         } catch (e: IOException) {
             e.printStackTrace()
@@ -153,11 +165,19 @@ class MandalaVpnService : VpnService() {
             vpnInterface = null
         }
         
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
+        
         stopSelf()
 
-        // 发送广播通知 UI 更新
-        sendBroadcast(Intent(ACTION_VPN_STOPPED).setPackage(packageName))
+        // 发送广播同步 UI 状态
+        val intent = Intent(ACTION_VPN_STOPPED).setPackage(packageName)
+        sendBroadcast(intent)
+        android.util.Log.d("MandalaVpn", "VPN 服务已彻底停止")
     }
 
     override fun onDestroy() {
