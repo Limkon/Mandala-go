@@ -98,6 +98,23 @@ func (d *Dialer) Dial() (net.Conn, error) {
 			spec.Extensions = append(spec.Extensions, &utls.ALPNExtension{AlpnProtocols: []string{"http/1.1"}})
 		}
 
+		// [关键修复] 如果启用了 ECH，确保 spec 中包含 ECH 扩展
+		// 很多时候 HelloChrome_Auto 预设里可能没有 ECH 扩展占位符，导致 utls 忽略 ECH 配置
+		if len(echConfigList) > 0 {
+			hasECH := false
+			for _, ext := range spec.Extensions {
+				// 检查是否存在 EncryptedClientHelloExtension
+				if _, ok := ext.(*utls.EncryptedClientHelloExtension); ok {
+					hasECH = true
+					break
+				}
+			}
+			if !hasECH {
+				// 强制注入 ECH 扩展，utls 会根据 Config 中的 EncryptedClientHelloConfigList 自动填充内容
+				spec.Extensions = append(spec.Extensions, &utls.EncryptedClientHelloExtension{})
+			}
+		}
+
 		if err := uConn.ApplyPreset(&spec); err != nil {
 			conn.Close()
 			return nil, fmt.Errorf("apply preset failed: %v", err)
