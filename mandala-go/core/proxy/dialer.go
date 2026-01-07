@@ -3,12 +3,14 @@ package proxy
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"math/rand"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"mandala/core/config"
@@ -21,6 +23,12 @@ import (
 func init() {
 	rand.Seed(time.Now().UnixNano())
 }
+
+// 简单的内存缓存，用于存储 ECH 配置，避免重复查询
+var (
+	echCache      = make(map[string][]byte)
+	echCacheMutex sync.RWMutex
+)
 
 type Dialer struct {
 	Config *config.OutboundConfig
@@ -40,21 +48,44 @@ func (d *Dialer) Dial() (net.Conn, error) {
 	}
 
 	// 2. 准备 TLS/uTLS 连接
-	// 标记是否已经完成了 TLS 握手
 	isTLSEstablished := false
 	
 	if d.Config.TLS != nil && d.Config.TLS.Enabled {
 		// [ECH] 获取配置
 		var echConfigList []byte
-		if d.Config.TLS.EnableECH && d.Config.TLS.ECHDoHURL != "" && d.Config.TLS.ECHPublicName != "" {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second) // 缩短超时防止卡顿
-			configs, err := resolveECHConfig(ctx, d.Config.TLS.ECHDoHURL, d.Config.TLS.ECHPublicName)
-			cancel()
+		
+		// 检查是否启用了 ECH 且配置了 DoH
+		if d.Config.TLS.EnableECH && d.Config.TLS.ECHDoHURL != "" {
+			// 确定查询的目标域名：优先用 PublicName，如果没有则用 ServerName
+			queryDomain := d.Config.TLS.ECHPublicName
+			if queryDomain == "" {
+				queryDomain = d.Config.TLS.ServerName // [自动回退]
+			}
 
-			if err == nil && len(configs) > 0 {
-				echConfigList = configs
+			// 尝试从缓存获取
+			echCacheMutex.RLock()
+			cached, ok := echCache[queryDomain]
+			echCacheMutex.RUnlock()
+
+			if ok {
+				echConfigList = cached
 			} else {
-				fmt.Printf("[ECH] Warning: Fetch failed: %v. Fallback to standard TLS.\n", err)
+				// 缓存未命中，发起 DoH 查询
+				// 设置较短的超时，避免阻塞主连接太久
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second) 
+				configs, err := resolveECHConfig(ctx, d.Config.TLS.ECHDoHURL, queryDomain)
+				cancel()
+
+				if err == nil && len(configs) > 0 {
+					echConfigList = configs
+					// 写入缓存 (简单策略：不设过期，直到重启)
+					echCacheMutex.Lock()
+					echCache[queryDomain] = configs
+					echCacheMutex.Unlock()
+					fmt.Printf("[ECH] Config fetched for %s\n", queryDomain)
+				} else {
+					fmt.Printf("[ECH] Warning: Fetch failed for %s: %v. Fallback to standard TLS.\n", queryDomain, err)
+				}
 			}
 		}
 
@@ -98,19 +129,16 @@ func (d *Dialer) Dial() (net.Conn, error) {
 			spec.Extensions = append(spec.Extensions, &utls.ALPNExtension{AlpnProtocols: []string{"http/1.1"}})
 		}
 
-		// [关键修复] 如果启用了 ECH，确保 spec 中包含 ECH 扩展
-		// 很多时候 HelloChrome_Auto 预设里可能没有 ECH 扩展占位符，导致 utls 忽略 ECH 配置
+		// 3. [关键] 强制注入 ECH 扩展
 		if len(echConfigList) > 0 {
 			hasECH := false
 			for _, ext := range spec.Extensions {
-				// 检查是否存在 EncryptedClientHelloExtension
 				if _, ok := ext.(*utls.EncryptedClientHelloExtension); ok {
 					hasECH = true
 					break
 				}
 			}
 			if !hasECH {
-				// 强制注入 ECH 扩展，utls 会根据 Config 中的 EncryptedClientHelloConfigList 自动填充内容
 				spec.Extensions = append(spec.Extensions, &utls.EncryptedClientHelloExtension{})
 			}
 		}
@@ -129,16 +157,10 @@ func (d *Dialer) Dial() (net.Conn, error) {
 		isTLSEstablished = true
 	}
 
-	// 3. 处理 WebSocket
+	// 3. 处理 WebSocket (保持原有修复逻辑)
 	if d.Config.Transport != nil && d.Config.Transport.Type == "ws" {
-		// [关键修复]
-		// 如果我们已经在上方手动完成了 TLS 握手 (isTLSEstablished == true)，
-		// 这里的 scheme 必须是 "ws" 而不是 "wss"。
-		// 因为 conn 已经是加密连接，websocket 库只需要写入明文 HTTP Upgrade 请求即可。
-		// 如果传 "wss"，库会尝试再次进行 TLS 握手，导致 "server gave HTTP response to HTTPS client" 错误。
 		scheme := "ws"
 		if d.Config.TLS != nil && d.Config.TLS.Enabled && !isTLSEstablished {
-			// 只有在没手动处理 TLS 的情况下，才让 websocket 库处理 wss
 			scheme = "wss"
 		}
 		
@@ -147,13 +169,11 @@ func (d *Dialer) Dial() (net.Conn, error) {
 			path = "/"
 		}
 		
-		// Host 头用于服务器路由，必须正确
 		host := d.Config.TLS.ServerName
 		if host == "" {
 			host = d.Config.Server
 		}
 		
-		// 这里的 wsURL 只是给库解析用的，实际上数据走的是 DialContext 返回的 conn
 		wsURL := fmt.Sprintf("%s://%s%s", scheme, host, path)
 
 		headers := make(http.Header)
@@ -162,13 +182,11 @@ func (d *Dialer) Dial() (net.Conn, error) {
 				headers.Set(k, v)
 			}
 		}
-		// 确保 Host 头存在
 		headers.Set("Host", host)
 
 		httpClient := &http.Client{
 			Transport: &http.Transport{
 				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-					// 直接返回已经建立好的（可能是加密的）连接
 					return conn, nil
 				},
 			},
@@ -195,28 +213,43 @@ func (d *Dialer) Dial() (net.Conn, error) {
 	return conn, nil
 }
 
-// resolveECHConfig 保持不变
+// resolveECHConfig 通过 DoH 查询 HTTPS 记录并提取 ECH 配置
+// 改进点：支持 GET 方法 (Base64Url)，兼容性更好
 func resolveECHConfig(ctx context.Context, dohURL string, domain string) ([]byte, error) {
 	msg := new(dns.Msg)
 	msg.SetQuestion(dns.Fqdn(domain), dns.TypeHTTPS)
 
+	// 序列化 DNS 请求
 	data, err := msg.Pack()
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", dohURL, strings.NewReader(string(data)))
+	// 使用 GET 方法发起请求 (Base64Url 编码 DNS 报文)
+	// 格式: ?dns=<base64url-encoded-message>
+	b64Query := base64.RawURLEncoding.EncodeToString(data)
+	reqURL := fmt.Sprintf("%s?dns=%s", dohURL, b64Query)
+	// 如果 dohURL 已经包含参数，需要适当处理 (简化起见假设 dohURL 不含参数或以 ? 结尾不太可能)
+	if strings.Contains(dohURL, "?") {
+		reqURL = fmt.Sprintf("%s&dns=%s", dohURL, b64Query)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/dns-message")
+	
+	// 设置标准 DoH 头
 	req.Header.Set("Accept", "application/dns-message")
+	req.Header.Set("Content-Type", "application/dns-message") // GET 请求通常不需要 Content-Type，但带上无妨
 
 	client := &http.Client{
 		Transport: &http.Transport{
 			DisableKeepAlives: true,
+			ResponseHeaderTimeout: 3 * time.Second,
 		},
 	}
+	
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -237,6 +270,7 @@ func resolveECHConfig(ctx context.Context, dohURL string, domain string) ([]byte
 		return nil, err
 	}
 
+	// 解析 HTTPS 记录中的 ECH 配置
 	for _, ans := range respMsg.Answer {
 		if https, ok := ans.(*dns.HTTPS); ok {
 			for _, val := range https.Value {
@@ -247,7 +281,7 @@ func resolveECHConfig(ctx context.Context, dohURL string, domain string) ([]byte
 		}
 	}
 
-	return nil, fmt.Errorf("no ECH config found")
+	return nil, fmt.Errorf("no ECH config found in DNS response")
 }
 
 // FragmentConn 保持不变
