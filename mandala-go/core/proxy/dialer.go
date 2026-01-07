@@ -90,9 +90,12 @@ func (d *Dialer) Dial() (net.Conn, error) {
 			}
 		}
 
-		// [TLS 1.3 强制] ECH 必须配合 TLS 1.3
+		// 判断是否启用了 ECH
+		useECH := len(echConfigList) > 0
+
+		// [TLS 1.3 强制] 如果使用 ECH，必须强制 TLS 1.3，否则使用默认 (TLS 1.2)
 		minVer := uint16(tls.VersionTLS12)
-		if len(echConfigList) > 0 {
+		if useECH {
 			minVer = tls.VersionTLS13
 		}
 
@@ -100,8 +103,15 @@ func (d *Dialer) Dial() (net.Conn, error) {
 			ServerName:         d.Config.TLS.ServerName,
 			InsecureSkipVerify: d.Config.TLS.Insecure,
 			MinVersion:         minVer,
-			NextProtos:         []string{"http/1.1"}, // 标准库配置，但在 uTLS HelloCustom 中不起决定作用
+			// 注意：这里虽设置了 NextProtos，但 utls 的 ClientHello 最终由 Spec 决定
+			// 为了保持一致性，如果不开 ECH，我们允许 h2
+			NextProtos:         []string{"h2", "http/1.1"}, 
 			EncryptedClientHelloConfigList: echConfigList,
+		}
+
+		if useECH {
+			// 如果开启 ECH，配置中仅保留 http/1.1 提示
+			uTlsConfig.NextProtos = []string{"http/1.1"}
 		}
 
 		if uTlsConfig.ServerName == "" {
@@ -112,36 +122,37 @@ func (d *Dialer) Dial() (net.Conn, error) {
 			conn = &FragmentConn{Conn: conn, active: true}
 		}
 
-		// [关键修复] 使用 HelloCustom 而不是 HelloChrome_Auto
-		// 因为我们需要手动修改 ALPN 列表，剔除 "h2"，强制使用 "http/1.1"
+		// 使用 HelloCustom 以便我们能灵活修改指纹
 		uConn := utls.UClient(conn, uTlsConfig, utls.HelloCustom)
 
-		// 1. 获取 Chrome 模版指纹 (包含 ECH 扩展结构)
+		// 1. 加载 Chrome 模版指纹
 		spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
 		if err != nil {
 			conn.Close()
 			return nil, fmt.Errorf("failed to get uTLS spec: %v", err)
 		}
 
-		// 2. [核心] 遍历扩展，强制修改 ALPN 为 http/1.1
-		// 这样服务器就不会协商出 h2，从而避免 malformed HTTP response 错误
-		foundALPN := false
-		for i, ext := range spec.Extensions {
-			if alpn, ok := ext.(*utls.ALPNExtension); ok {
-				alpn.AlpnProtocols = []string{"http/1.1"} // 强制覆盖，移除 h2
-				spec.Extensions[i] = alpn
-				foundALPN = true
-				break
+		// 2. [差异化逻辑] 根据 ECH 状态调整 ALPN
+		if useECH {
+			// 【开启 ECH 时】：强制只使用 http/1.1
+			// 原因：防止 Cloudflare 协商到 h2 导致 WebSocket 库崩溃
+			foundALPN := false
+			for i, ext := range spec.Extensions {
+				if alpn, ok := ext.(*utls.ALPNExtension); ok {
+					alpn.AlpnProtocols = []string{"http/1.1"} // 强制覆盖
+					spec.Extensions[i] = alpn
+					foundALPN = true
+					break
+				}
 			}
+			if !foundALPN {
+				spec.Extensions = append(spec.Extensions, &utls.ALPNExtension{AlpnProtocols: []string{"http/1.1"}})
+			}
+		} else {
+			// 【未开启 ECH 时】：不修改指纹，使用自动协商 (保留 h2)
+			// 此时 spec 中的 ALPN 依然包含 "h2", "http/1.1"
+			// 注意：如果服务端协商出 h2，WebSocket 可能会报错 "malformed HTTP response"
 		}
-		if !foundALPN {
-			// 如果模版里没 ALPN (不太可能)，手动加一个
-			spec.Extensions = append(spec.Extensions, &utls.ALPNExtension{AlpnProtocols: []string{"http/1.1"}})
-		}
-
-		// 注意：我们不再手动注入 EncryptedClientHelloExtension
-		// 因为 HelloChrome_Auto 模版中通常已经包含了该扩展的占位符。
-		// 只要 uTlsConfig.EncryptedClientHelloConfigList 有值，utls 就会自动填充它。
 
 		if err := uConn.ApplyPreset(&spec); err != nil {
 			conn.Close()
@@ -192,7 +203,6 @@ func (d *Dialer) Dial() (net.Conn, error) {
 			},
 		}
 
-		// 增加超时
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 
@@ -214,7 +224,7 @@ func (d *Dialer) Dial() (net.Conn, error) {
 	return conn, nil
 }
 
-// resolveECHConfig (保留 Base64Url 逻辑)
+// resolveECHConfig
 func resolveECHConfig(ctx context.Context, dohURL string, domain string) ([]byte, error) {
 	msg := new(dns.Msg)
 	msg.SetQuestion(dns.Fqdn(domain), dns.TypeHTTPS)
